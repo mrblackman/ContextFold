@@ -2,25 +2,75 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mrblackman/ContextFold/schemas/cold_node.schema.json",
   "title": "ColdNodePayload",
-  "description": "Schema for decoupled raw cold storage historical node files.",
+  "description": "Schema for decoupled raw cold storage historical node files (IPCF-1.1). Each file stores one archived turn with three hash identities per CONFORMANCE.md §2.",
   "type": "object",
   "properties": {
-    "step_id": { "type": "integer" },
-    "session_id": { "type": "string" },
-    "original_prompt": { "type": "string" },
+    "ipcf_version": {
+      "type": "string",
+      "description": "Specification version string (e.g. '1.1')."
+    },
+    "step_id": {
+      "type": "integer",
+      "description": "Canonical turn index sourced from conversation history."
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Active conversation session identifier."
+    },
+    "folded_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp when this node was folded."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Human-readable summary of the folded turn."
+    },
+    "raw_content": {
+      "type": "string",
+      "description": "Full verbatim content of the archived turn (lossless, CONF-01)."
+    },
+    "payload_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of raw source content before folding. Immutable content identity (CONF-02). MUST remain identical through fold → store → hydrate lifecycle."
+    },
+    "projection_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the canonical projection fields in fixed order. Deterministic logical identity (CONF-11). Runtime-independent — same inputs always produce identical hash."
+    },
+    "token_estimate": {
+      "type": "integer",
+      "description": "Rough token count estimate (~4 chars per token). Reference heuristic only."
+    },
+    "sanitized": {
+      "type": "boolean",
+      "description": "True if API tokens, passwords, and credentials have been scrubbed before writing to disk. Production implementations MUST set this to true after a regex redaction pass."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["cold", "hydrated", "evicted"],
+      "description": "Lifecycle state of this node."
+    },
+    "original_prompt": {
+      "type": "string",
+      "description": "Optional: the exact user prompt that produced this turn."
+    },
     "raw_tool_calls": {
       "type": "array",
       "items": {
         "type": "object",
         "properties": {
-          "tool": { "type": "string" },
-          "command": { "type": "string" },
+          "tool":      { "type": "string" },
+          "command":   { "type": "string" },
           "exit_code": { "type": "integer" },
-          "stdout": { "type": "string" },
-          "stderr": { "type": "string" }
+          "stdout":    { "type": "string" },
+          "stderr":    { "type": "string" }
         },
         "required": ["tool"]
-      }
+      },
+      "description": "Raw tool call records from the archived turn."
     },
     "code_diffs": {
       "type": "array",
@@ -31,12 +81,9 @@
           "diff": { "type": "string" }
         },
         "required": ["file", "diff"]
-      }
-    },
-    "sanitized": {
-      "type": "boolean",
-      "description": "True if secrets and credentials have been scrubbed before writing."
+      },
+      "description": "Code diffs produced during this turn."
     }
   },
-  "required": ["step_id", "session_id", "sanitized"]
+  "required": ["ipcf_version", "step_id", "session_id", "folded_at", "raw_content", "payload_sha256", "projection_sha256", "sanitized"]
 }

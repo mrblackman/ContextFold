@@ -2,66 +2,74 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mrblackman/ContextFold/schemas/recall_index.schema.json",
   "title": "RecallIndex",
-  "description": "Deterministic Historical Addressing Layer schema for exact historical retrieval (IPCF-1.1).",
+  "description": "Deterministic Historical Addressing Layer — IPCF-1.1 recall index. Nodes are keyed by string step_id for O(1) lookup.",
   "type": "object",
   "properties": {
+    "ipcf_version": {
+      "type": "string",
+      "description": "Specification version (e.g. '1.1')."
+    },
     "session_id": {
       "type": "string",
       "description": "Active conversation session identifier."
     },
-    "last_updated": {
+    "created_at": {
       "type": "string",
-      "format": "date-time"
+      "format": "date-time",
+      "description": "Timestamp when this index was first created."
     },
     "nodes": {
-      "type": "array",
-      "items": {
+      "type": "object",
+      "description": "Map of step_id (string key) → node metadata. Dict keyed by string step_id for O(1) lookup.",
+      "additionalProperties": {
         "type": "object",
         "properties": {
-          "step_id": { "type": "integer" },
-          "timestamp": { "type": "string", "format": "date-time" },
-          "files": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Target file paths created, modified, or inspected in this step."
+          "step_id": {
+            "type": "integer",
+            "description": "Canonical turn index sourced from conversation history."
           },
-          "symbols": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Functions, classes, structs, or methods touched."
+          "summary": {
+            "type": "string",
+            "description": "Human-readable summary of the folded turn."
+          },
+          "payload_sha256": {
+            "type": "string",
+            "description": "SHA-256 of raw source content before folding (CONF-02: immutable content identity)."
+          },
+          "projection_sha256": {
+            "type": "string",
+            "description": "SHA-256 of the canonical projection fields (CONF-11: deterministic logical identity)."
+          },
+          "artifact_sha256": {
+            "type": "string",
+            "description": "SHA-256 of the serialized cold node file on disk (CONF-09: tamper detection)."
+          },
+          "file_path": {
+            "type": "string",
+            "description": "Absolute or relative disk path to the cold storage payload file."
+          },
+          "token_estimate": {
+            "type": "integer",
+            "description": "Rough token count estimate for the archived content."
+          },
+          "folded_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC timestamp when this node was folded."
           },
           "identifiers": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "Ports, environment variables, configuration keys, or tokens."
+            "description": "Sorted, deduplicated searchable tokens extracted from summary (CONF-11: deterministic)."
           },
-          "commands": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Exact CLI commands executed in this step."
-          },
-          "errors": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Compiler error codes or runtime exception messages encountered."
-          },
-          "entities": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Domain services, database tables, or business entities discussed."
-          },
-          "content_sha256": {
-            "type": "string",
-            "description": "SHA-256 integrity hash of the raw cold node payload on disk."
-          },
-          "cold_node_ref": {
-            "type": "string",
-            "description": "Relative disk path to the cold storage payload file."
+          "evicted": {
+            "type": "boolean",
+            "description": "True if this node has been evicted from the active prompt after rehydration (CONF-07)."
           }
         },
-        "required": ["step_id", "timestamp", "cold_node_ref", "content_sha256"]
+        "required": ["step_id", "payload_sha256", "projection_sha256", "artifact_sha256", "file_path", "folded_at", "evicted"]
       }
     }
   },
-  "required": ["session_id", "last_updated", "nodes"]
+  "required": ["ipcf_version", "nodes"]
 }

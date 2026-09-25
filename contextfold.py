@@ -90,6 +90,25 @@ def sha256_of_file(path: str) -> str:
 def sha256_of_str(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
+def _compute_projection_sha256(step_id: int, normalized_content: str, identifiers: list) -> str:
+    """
+    CONF-11: Deterministic Logical Identity — runtime-independent, reproducible.
+    Computed exclusively from the canonical projection fields in a fixed order.
+    Same step_id + same content + same identifiers → identical hash on any machine.
+    """
+    canonical = json.dumps(
+        {
+            "projection_version": "ipcf-projection-v1",
+            "step_id": step_id,
+            "normalized_content": normalized_content.strip(),
+            "identifiers": sorted(identifiers),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 def atomic_write_json(path: str, data: dict) -> None:
     """Write JSON atomically via temp-file-then-rename. CONF-12 (Atomic Fold)."""
     dir_ = os.path.dirname(path) or "."
@@ -148,7 +167,7 @@ def _estimate_tokens(text: str) -> int:
 # Core Engine
 # ──────────────────────────────────────────────────────────────
 
-def cmd_fold(step_id: int, summary: str, raw_content: str = None) -> None:
+def cmd_fold(step_id: int, summary: str, raw_content: str = None, session_id: str = None) -> None:
     """
     Fold (archive) a turn into cold storage.
 
@@ -156,6 +175,11 @@ def cmd_fold(step_id: int, summary: str, raw_content: str = None) -> None:
     Phase 2: Update recall index (atomic).
     CONF-12: If crash between phases, orphaned node is detectable on next validate.
     CONF-11: Deterministic output — no uuid4(), no datetime in index keys.
+
+    Three Hash Identities (CONFORMANCE.md §2):
+      payload_sha256    — immutable content identity (CONF-02)
+      projection_sha256 — deterministic logical identity (CONF-11)
+      artifact_sha256   — physical on-disk serialization identity (CONF-09)
     """
     ensure_dirs()
     index = load_index()
@@ -165,16 +189,25 @@ def cmd_fold(step_id: int, summary: str, raw_content: str = None) -> None:
         return
 
     payload_text = raw_content or summary
-    content_sha256 = sha256_of_str(payload_text)
+    normalized_content = payload_text.strip()
+
+    # Three hash identities
+    payload_sha256 = sha256_of_str(payload_text)
+    identifiers = _extract_identifiers(summary)
+    projection_sha256 = _compute_projection_sha256(step_id, normalized_content, identifiers)
 
     cold_node = {
         "ipcf_version": "1.1",
         "step_id": step_id,
+        "session_id": session_id or "default-session",
         "folded_at": _iso_now(),
         "summary": summary,
         "raw_content": payload_text,
-        "content_sha256": content_sha256,
+        "payload_sha256": payload_sha256,       # CONF-02: immutable content identity
+        "projection_sha256": projection_sha256, # CONF-11: deterministic logical identity
         "token_estimate": _estimate_tokens(payload_text),
+        "sanitized": False,  # Reference impl: secret scrubbing not implemented.
+                             # Production MUST set True after regex redaction pass.
         "status": "cold"
     }
 
@@ -182,17 +215,15 @@ def cmd_fold(step_id: int, summary: str, raw_content: str = None) -> None:
 
     # Phase 1 — write cold node (atomic)
     atomic_write_json(node_path, cold_node)
-    file_sha256 = sha256_of_file(node_path)
+    artifact_sha256 = sha256_of_file(node_path)  # CONF-09: physical on-disk identity
 
     # Phase 2 — update recall index (atomic)
-    # Extract searchable entities from summary for Deterministic Addressing
-    identifiers = _extract_identifiers(summary)
-
     index["nodes"][str(step_id)] = {
         "step_id": step_id,
         "summary": summary,
-        "content_sha256": content_sha256,
-        "file_sha256": file_sha256,
+        "payload_sha256": payload_sha256,
+        "projection_sha256": projection_sha256,
+        "artifact_sha256": artifact_sha256,
         "file_path": node_path,
         "token_estimate": cold_node["token_estimate"],
         "folded_at": cold_node["folded_at"],
@@ -202,10 +233,13 @@ def cmd_fold(step_id: int, summary: str, raw_content: str = None) -> None:
     save_index(index)
 
     print(f"[FOLD] Step {step_id} archived.")
-    print(f"  Summary     : {summary[:80]}")
-    print(f"  SHA-256     : {content_sha256[:16]}…")
-    print(f"  Tokens est. : {cold_node['token_estimate']}")
-    print(f"  File        : {node_path}")
+    print(f"  Summary           : {summary[:80]}")
+    print(f"  payload_sha256    : {payload_sha256[:16]}…")
+    print(f"  projection_sha256 : {projection_sha256[:16]}…")
+    print(f"  artifact_sha256   : {artifact_sha256[:16]}…")
+    print(f"  Tokens est.       : {cold_node['token_estimate']}")
+    print(f"  File              : {node_path}")
+
 
 def _extract_identifiers(text: str) -> list:
     """
@@ -258,10 +292,11 @@ def cmd_recall(query: str) -> None:
         status_label = "latest_chronological" if rank == 0 else "historical"
         evicted_note = " [EVICTED]" if node.get("evicted") else ""
         print(f"  [{rank+1}] Step {step_id:>4}  |  score={score}  |  {status_label}{evicted_note}")
-        print(f"       Summary : {node['summary'][:80]}")
-        print(f"       SHA-256 : {node['content_sha256'][:16]}…")
-        print(f"       Tokens  : {node['token_estimate']}")
-        print(f"       Folded  : {node['folded_at']}")
+        print(f"       Summary           : {node['summary'][:80]}")
+        print(f"       payload_sha256    : {node['payload_sha256'][:16]}…")
+        print(f"       projection_sha256 : {node.get('projection_sha256', 'N/A')[:16]}…")
+        print(f"       Tokens            : {node['token_estimate']}")
+        print(f"       Folded            : {node['folded_at']}")
         print()
 
 def cmd_hydrate(step_id: int) -> None:
@@ -290,10 +325,10 @@ def cmd_hydrate(step_id: int) -> None:
     # Integrity check — CONF-02, CONF-09
     if policy.get("integrity_verification", True):
         actual_sha = sha256_of_file(node_path)
-        expected_sha = node_meta["file_sha256"]
+        expected_sha = node_meta["artifact_sha256"]
         if actual_sha != expected_sha:
             raise IntegrityCheckError(
-                f"IntegrityCheckError: SHA-256 mismatch for step {step_id}.\n"
+                f"IntegrityCheckError: artifact_sha256 mismatch for step {step_id}.\n"
                 f"  Expected : {expected_sha}\n"
                 f"  Actual   : {actual_sha}\n"
                 f"  (CONF-09 / CONF-12 Scenario C)"
@@ -311,9 +346,9 @@ def cmd_hydrate(step_id: int) -> None:
         print(f"[WARN] Content truncated to {max_tokens} tokens (policy cap). (CONF-06)")
 
     print(f"\n[HYDRATE] Step {step_id} — exact verbatim content:")
-    print(f"  Token estimate : {min(token_estimate, max_tokens)}")
-    print(f"  SHA-256        : {cold_node['content_sha256'][:16]}…")
-    print(f"  Scope          : {policy.get('scope', 'single_turn')} (evict after response)")
+    print(f"  Token estimate    : {min(token_estimate, max_tokens)}")
+    print(f"  payload_sha256    : {cold_node['payload_sha256'][:16]}…")
+    print(f"  Scope             : {policy.get('scope', 'single_turn')} (evict after response)")
     print()
     print("─" * 60)
     print(content)
@@ -419,16 +454,16 @@ def cmd_validate() -> None:
 
         if policy.get("integrity_verification", True):
             actual_sha = sha256_of_file(node_path)
-            expected_sha = node_meta.get("file_sha256", "")
+            expected_sha = node_meta.get("artifact_sha256", "")
             if actual_sha != expected_sha:
-                msg = (f"CONF-09 / CONF-12 Scenario C — SHA mismatch for step {step_id}. "
+                msg = (f"CONF-09 / CONF-12 Scenario C — artifact_sha256 mismatch for step {step_id}. "
                        f"Expected={expected_sha[:16]}… Actual={actual_sha[:16]}…")
                 errors.append(msg)
                 print(f"  [FAIL] Step {step_id:>4}: {msg}")
                 continue
 
         pass_count += 1
-        print(f"  [ OK ] Step {step_id:>4}: SHA-256 verified. (CONF-02 / CONF-09)")
+        print(f"  [ OK ] Step {step_id:>4}: artifact_sha256 verified. (CONF-02 / CONF-09)")
 
     # 2. Detect orphaned cold nodes (CONF-12 Scenario A)
     if os.path.isdir(COLD_NODE_DIR):
@@ -450,6 +485,7 @@ def cmd_validate() -> None:
     print()
     if not errors:
         print(f"  Validation PASSED — {pass_count} node(s) verified. IPCF-1.1 integrity confirmed.")
+        sys.exit(0)
     else:
         print(f"  Validation FAILED — {len(errors)} error(s), {pass_count} passed.")
         print()
@@ -457,6 +493,8 @@ def cmd_validate() -> None:
         for e in errors:
             print(f"    • {e}")
     print()
+    if errors:
+        sys.exit(1)
 
 def cmd_demo() -> None:
     """
