@@ -12,7 +12,7 @@
     "max_rehydration_tokens_per_call": {
       "type": "integer",
       "default": 3000,
-      "description": "Hard token cap for any single fetch_archived_node response."
+      "description": "Reference default: 3000 tokens. IPCF Invariant 4 requires bounded rehydration (the cap MUST exist and be enforced); the specific threshold is a deployment policy — implementors MAY override this value. Any override must be documented in the implementation's conformance profile."
     },
     "scope": {
       "type": "string",
