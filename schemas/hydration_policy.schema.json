@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mrblackman/ContextFold/schemas/hydration_policy.schema.json",
+  "title": "HydrationPolicy",
+  "description": "Rules governing bounded on-demand memory hydration and prompt eviction (IPCF-1.1).",
+  "type": "object",
+  "properties": {
+    "policy_version": {
+      "type": "string",
+      "default": "1.1"
+    },
+    "max_rehydration_tokens_per_call": {
+      "type": "integer",
+      "default": 3000,
+      "description": "Hard token cap for any single fetch_archived_node response."
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["single_turn"],
+      "default": "single_turn",
+      "description": "Strict boundary: hydrated payload exists in LLM context only for the active turn."
+    },
+    "eviction_trigger": {
+      "type": "string",
+      "enum": ["after_response"],
+      "default": "after_response",
+      "description": "Enforced eviction: hydrated payload is automatically pruned from prompt on next user turn."
+    },
+    "integrity_verification": {
+      "type": "boolean",
+      "default": true,
+      "description": "Verify SHA-256 hash against recall index before hydrating payload into prompt."
+    }
+  },
+  "required": ["max_rehydration_tokens_per_call", "scope", "eviction_trigger"]
+}

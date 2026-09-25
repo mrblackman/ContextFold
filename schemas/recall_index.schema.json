@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mrblackman/ContextFold/schemas/recall_index.schema.json",
+  "title": "RecallIndex",
+  "description": "Deterministic Historical Addressing Layer schema for exact historical retrieval (IPCF-1.1).",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "Active conversation session identifier."
+    },
+    "last_updated": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "step_id": { "type": "integer" },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "files": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Target file paths created, modified, or inspected in this step."
+          },
+          "symbols": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Functions, classes, structs, or methods touched."
+          },
+          "identifiers": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Ports, environment variables, configuration keys, or tokens."
+          },
+          "commands": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Exact CLI commands executed in this step."
+          },
+          "errors": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Compiler error codes or runtime exception messages encountered."
+          },
+          "entities": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Domain services, database tables, or business entities discussed."
+          },
+          "content_sha256": {
+            "type": "string",
+            "description": "SHA-256 integrity hash of the raw cold node payload on disk."
+          },
+          "cold_node_ref": {
+            "type": "string",
+            "description": "Relative disk path to the cold storage payload file."
+          }
+        },
+        "required": ["step_id", "timestamp", "cold_node_ref", "content_sha256"]
+      }
+    }
+  },
+  "required": ["session_id", "last_updated", "nodes"]
+}
