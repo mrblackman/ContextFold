@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mrblackman/ContextFold/schemas/folded_step.schema.json",
+  "title": "FoldedStepSummary",
+  "description": "Standardized schema for in-place folded conversation steps in active LLM working memory.",
+  "type": "object",
+  "properties": {
+    "step_id": {
+      "type": "integer",
+      "description": "Unique identifier of the conversation turn or action block."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of step completion."
+    },
+    "target_files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of files touched, read, or modified."
+    },
+    "action_type": {
+      "type": "string",
+      "enum": ["CODE_MODIFICATION", "COMMAND_EXECUTION", "EXPLORATION", "REFACTOR", "VERIFICATION", "OTHER"]
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 280,
+      "description": "Concise, 1-2 sentence executive summary of the outcome."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["SUCCESS", "FAILED", "PARTIAL", "BLOCKED"]
+    },
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "cold_node_ref": {
+          "type": "string",
+          "description": "Relative path to the decoupled raw payload on disk."
+        }
+      },
+      "required": ["cold_node_ref"]
+    }
+  },
+  "required": ["step_id", "timestamp", "summary", "status", "artifacts"]
+}

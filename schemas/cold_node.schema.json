@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mrblackman/ContextFold/schemas/cold_node.schema.json",
+  "title": "ColdNodePayload",
+  "description": "Schema for decoupled raw cold storage historical node files.",
+  "type": "object",
+  "properties": {
+    "step_id": { "type": "integer" },
+    "session_id": { "type": "string" },
+    "original_prompt": { "type": "string" },
+    "raw_tool_calls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "tool": { "type": "string" },
+          "command": { "type": "string" },
+          "exit_code": { "type": "integer" },
+          "stdout": { "type": "string" },
+          "stderr": { "type": "string" }
+        },
+        "required": ["tool"]
+      }
+    },
+    "code_diffs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "file": { "type": "string" },
+          "diff": { "type": "string" }
+        },
+        "required": ["file", "diff"]
+      }
+    },
+    "sanitized": {
+      "type": "boolean",
+      "description": "True if secrets and credentials have been scrubbed before writing."
+    }
+  },
+  "required": ["step_id", "session_id", "sanitized"]
+}
