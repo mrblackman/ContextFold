@@ -18,6 +18,9 @@
 > *"Don't make the AI carry what the machine can page."*  
 > *"Don't ask the AI to remember what the machine can retrieve."*
 
+> ⚠️ **Specification Status: RFC Draft — Under Active Development**  
+> This repository specifies the normative protocol, data models, and verification criteria for in-place context folding (`IPCF-1.1`). Formal conformance testing (`CONFORMANCE.md`) and reference engine refinements (`contextfold.py`) are actively underway. Feedback and implementations from agent harness teams are welcome.
+
 ---
 
 ## 🎯 1. Executive Summary
