@@ -30,7 +30,7 @@ Today's developer is trapped in a painful dichotomy:
 
 **ContextFold (IPCF-1.1)** resolves this dilemma by adapting the proven computer science paradigm of **Virtual Memory Paging** to active LLM conversation runtimes. Unlike summarization tools that discard raw history, ContextFold operates an **In-Place Dual-Projection Architecture** that keeps the developer in the same session while decoupling active prompt context from archival disk storage.
 
-### The Three Frequencies of Fidelity:
+### The Three Dimensions of Fidelity:
 * **Storage Fidelity: Exact (Lossless):** 100% of raw conversation bytes, compiler outputs, and diffs are preserved permanently on disk (`cold_nodes/`), verified by SHA-256 integrity hashes.
 * **Active Context Fidelity: Bounded & Selective:** Active LLM prompt context is compressed by ~96% (from 200k to ~8k tokens), containing strictly hot working memory and high-level architectural constraints.
 * **Retrieval Fidelity: Exact:** Historical nodes are recalled on demand with byte-level original accuracy via a **Deterministic Historical Addressing Layer**.
@@ -222,7 +222,20 @@ ContextFold forms the core memory management tier of the **Agent Operating Archi
 
 ---
 
-## 📜 9. License & Attribution
+## 🧪 9. Conformance & Verification (`CONFORMANCE.md`)
+
+To guarantee that ContextFold engines operate deterministically rather than relying on qualitative claims, the specification defines **10 Normative Conformance Requirements** in **[CONFORMANCE.md](CONFORMANCE.md)**:
+
+* **CONF-01 – CONF-03:** Lossless storage, SHA-256 round-trip integrity, and deterministic indexing.
+* **CONF-04:** Temporal disambiguation (chronological resolution when configurations evolve across turns).
+* **CONF-05 – CONF-07:** Exact verbatim retrieval, bounded rehydration caps, and single-turn prompt eviction.
+* **CONF-08 – CONF-10:** UI dual-projection isolation, tamper detection, and explicit failure modes.
+
+Implementations must pass all 10 test suites to claim **`IPCF-1.1 Compliant`** status.
+
+---
+
+## 📜 10. License & Attribution
 
 Released under the **[MIT License](LICENSE)**.
 
