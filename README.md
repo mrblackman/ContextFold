@@ -26,6 +26,22 @@
 
 ---
 
+## 🔌 0. Runtime Assumptions & Integration Surface
+
+IPCF is engineered specifically for **active Agent Harnesses and IDE Runtimes** (such as Google Antigravity, Claude Code, Cursor, Windsurf, Aider, and custom agent loops) that programmatically assemble and manage the LLM's message array and prompt context on every conversational turn.
+
+> ⚠️ **Non-Applicability to Passive Web Chats:**  
+> IPCF **CANNOT** run inside standard consumer web chat interfaces (such as vanilla ChatGPT or Claude.ai web UIs) where the server-side platform owns transcript persistence and appends messages monolithically without client-side memory control.
+
+### Required Harness Capabilities:
+To implement IPCF, a hosting agent harness MUST support:
+1. **Dynamic Context Window Assembly:** The ability to inject ephemeral system or user messages into the active prompt payload *before* dispatching to the LLM.
+2. **Turn-Level Lifecycle Hooks:**
+   - `pre_turn_dispatch`: Intercept incoming user prompt, passively scan identifiers against `recall_index.json`, and hydrate matching cold nodes.
+   - `post_turn_response`: Execute single-turn prompt eviction (`CONF-07`), pruning hydrated nodes back down to baseline working memory before the subsequent turn.
+
+---
+
 ## 🎯 1. Executive Summary
 
 Modern AI coding assistants routinely reach 150,000–250,000+ tokens during extended engineering sessions. While Large Language Models advertise theoretical context windows of 1M+ tokens, empirical research (Stanford's *Lost in the Middle*, Chroma's *MECW*, RULER) establishes that **multi-step agentic reasoning degrades past 60,000–80,000 tokens ("Context Rot")**.
@@ -57,6 +73,13 @@ Any compliant implementation MUST enforce four non-negotiable architectural inva
 2. **Deterministic Folding:** The transformation of raw tool logs into folded summary schema is strictly rule-bound and reproducible — same input always produces the same output.
 3. **Exact Retrieval:** Historical information is not re-hallucinated; it is fetched directly from the verifiable cold storage file.
 4. **Bounded Rehydration:** Recalled nodes exist in the prompt strictly for the turn in which they are inspected (`scope: single_turn`). They are automatically evicted on the subsequent turn, preventing context re-bloating (`8k → 13k → 8k`).
+
+### What is Deterministic, What is Not?
+
+To avoid conceptual ambiguity, IPCF draws a strict boundary between semantic interpretation and deterministic protocol execution:
+
+* **Semantic / Non-Deterministic Input:** Generating a high-level summary from verbose compiler outputs, test suites, or raw terminal dumps is an inherently semantic task (performed by an LLM or human engineer). IPCF does NOT claim that natural language summarization is mathematically deterministic.
+* **Deterministic / Verifiable Protocol:** Once a summary and raw payload are provided to the fold engine, the entire lifecycle — canonical projection ordering, keyword identifier extraction, indexing, SHA-256 verification (`projection_sha256`, `artifact_sha256`), filesystem persistence, and hydration — is **100% deterministic and mathematically reproducible** across platforms (CONF-11).
 
 ---
 
@@ -104,18 +127,39 @@ flowchart TD
 | **Disk Storage / Swap** | Lossless Cold Storage Archive (`cold_nodes/step_XYZ.json`) |
 | **Page-Out (Swap Out)** | `fold_turn()`: Compress verbose logs into schema summary on disk |
 | **Page-In (Swap In)** | `fetch_archived_node()`: On-demand single-turn rehydration |
-| **Memory Address Bus** | Deterministic Historical Addressing Layer (Recall Index) |
-| **Page Fault** | Agent needs past parameter not in hot context |
+| **Memory Address Bus / MMU** | Deterministic Addressing Layer + **Passive Recall Interception** |
+| **Page Fault** | User or agent touches a concept archived in cold storage |
 | **Page Eviction** | Automated pruning of hydrated node on the next turn |
 
 ---
 
 ## 🔍 4. Deterministic Historical Addressing Layer
 
-### The Problem: *"How does the model know which step to fetch?"*
-If a model needs to recall *"Which Docker port did we assign to Postgres 200 turns ago?"*, it cannot guess that this occurred at `step_id: 137`. A pure `step_id → payload` key-value lookup fails when the key is forgotten.
+### The Meta-Cognition Problem: Why Pull-Based Recall Fails
+If an architecture expects the LLM to realize *"I do not remember the Docker port from 200 turns ago, so I will invoke `recall_archived_nodes('PostgreSQL')`"*, it fails in practice.
+LLMs suffer from severe **meta-cognitive blind spots**: models rarely detect their own lack of knowledge; instead of issuing a pull-based tool call, they confidently hallucinate plausible parameters.
 
-### The Solution: Multi-Dimensional Recall Index
+### The Breakthrough: Push-Based Passive Recall (The Software MMU Pattern)
+In modern operating systems, virtual memory paging is **push-based and transparent**: the CPU does not ask the OS to load a missing page; the Memory Management Unit (MMU) traps the memory address access, loads the page from disk, and presents it to the process invisibly.
+
+IPCF-1.1 introduces the **Software MMU Pattern** (`CONF-13 Candidate`):
+1. **Passive Interception:** On every turn (`pre_turn_dispatch`), the Agent Harness passively scans the user prompt and working state against the set of `identifiers` indexed in `recall_index.json`.
+2. **Transparent Page-In:** If a keyword or symbol matches, the harness **automatically hydrates** the candidate cold node into the active prompt *before* the LLM generates tokens.
+3. **Zero Meta-Cognitive Burden:** The LLM does not need to know that it had forgotten the parameter; the verified ground truth is already on its desk.
+4. **Single-Turn Eviction:** Following generation, the paged-in node is evicted (`post_turn_response`), ensuring the active prompt resets to baseline (~8k tokens).
+
+```mermaid
+flowchart TD
+    USER["User asks: 'What port did we map for PostgreSQL?'"] --> HARNESS["Agent Harness (Software MMU)"]
+    HARNESS -->|"Passive Scan against recall_index identifiers"| MATCH{"Identifier Match?"}
+    MATCH -->|"Match: 'postgresql', 'port' -> Step 137"| HYDRATE["Transparent Hydration (artifact_sha256 verified)"]
+    MATCH -->|"No Match"| DISPATCH["Direct Dispatch to LLM"]
+    HYDRATE -->|"Inject Cold Node into Prompt (+2.4k tokens)"| DISPATCH
+    DISPATCH -->|"LLM Generates Verified Accurate Response"| OUT["Agent Response"]
+    OUT -->|"post_turn_response hook"| PURGE["Evict Step 137 Payload (Prompt resets to ~8k)"]
+```
+
+### Multi-Dimensional Recall Index Structure
 IPCF-1.1 specifies a **Deterministic Historical Addressing Layer** conforming to [`recall_index.schema.json`](schemas/recall_index.schema.json). During folding, machine parsing extracts an inverted index of structural entities:
 
 ```json
@@ -129,17 +173,10 @@ IPCF-1.1 specifies a **Deterministic Historical Addressing Layer** conforming to
 }
 ```
 
-### Two-Stage Recall
-
-```mermaid
-flowchart TD
-    LLM["LLM Agent Needs Historical Data"] -->|"1. recall '5433'"| IDX["Deterministic Addressing Layer"]
-    IDX -->|"Returns: Step 137"| LLM
-    LLM -->|"2. hydrate step_id=137"| STORAGE["Cold Node Storage (Disk)"]
-    STORAGE -->|"Verifies artifact_sha256 & Hydrates"| TURN["Active Turn Prompt (+2.4k tokens)"]
-    TURN -->|"Generates Verified Answer"| Out["Agent Response"]
-    Out -->|"Next Turn: Eviction Enforced (CONF-07)"| PURGE["Hydrated Node Evicted"]
-```
+### Keyword-Based vs. Semantic Recall Trade-Off
+* **Reference Implementation Choice:** `contextfold.py` employs exact-token and keyword-normalized matching (`_extract_identifiers`). This preserves the **Zero External Dependencies** mandate (pure Python standard library, no torch, no numpy, no vector DB).
+* **The Trade-Off:** Keyword matching is fast, zero-cost, and strictly deterministic, but vulnerable to synonyms or paraphrased queries.
+* **Production Extension Path:** Production harnesses (IDE plugins, enterprise agents) are explicitly encouraged to extend the recall index with local vector embeddings or hybrid BM25 + dense retrieval without altering the cold storage or SHA-256 verification contracts.
 
 ---
 
@@ -183,15 +220,14 @@ At Turn 490, developer asks:
 "What port are we using for PostgreSQL, and which migration applied the billing table?"
 
 Without ContextFold:
-- Context is at 230,000 tokens. Severe attention dilution.
+- Context is at 230,000 tokens. Severe attention dilution, high hallucination.
 
 With ContextFold:
 1. Active prompt is at 8,200 tokens.
-2. Agent: recall_archived_nodes(query='PostgreSQL port')
-3. Index returns: Step 137 (latest), Step 91, Step 37 — chronologically ranked.
-4. Agent: hydrate(step_id=137) and hydrate(step_id=318)
-5. artifact_sha256 verified. Exact configurations rendered.
-6. Both nodes evicted. Active prompt returns to 8,200 tokens.
+2. Harness Software MMU scans user query: matches ['postgresql', 'port'] -> Step 137 (latest chronological), Step 91, Step 37.
+3. Harness transparently hydrates Step 137 (SHA-256 verified) before model execution.
+4. Model generates exact, verified response in 1.1s.
+5. Post-turn hook evicts Step 137 payload. Active prompt returns to 8,200 tokens.
 ```
 
 > **The key insight:** The model does NOT carry 500 turns of baggage. But when needed, it retrieves the verified truth instantly — without hallucination.
@@ -208,7 +244,10 @@ ContextFold provides an official reference CLI written in pure Python 3.10+ stan
 # Archive a turn into cold storage
 python contextfold.py fold 42 "PostgreSQL configured on port 5433"
 
-# Search archived nodes
+# Passively scan user prompt against recall index (Software MMU pattern)
+python contextfold.py scan "What port did we set for PostgreSQL?"
+
+# Query archived nodes explicitly
 python contextfold.py recall "PostgreSQL port"
 
 # Hydrate a cold node into active prompt (SHA-256 verified)
@@ -273,15 +312,16 @@ ContextFold forms the memory management tier of the **Agent Context System**:
 
 ## 🧪 11. Conformance & Verification (`CONFORMANCE.md`)
 
-To guarantee that ContextFold engines operate deterministically, the specification defines **12 Normative Conformance Requirements** in **[CONFORMANCE.md](CONFORMANCE.md)**:
+To guarantee that ContextFold engines operate deterministically, the specification defines **13 Normative Conformance Requirements** in **[CONFORMANCE.md](CONFORMANCE.md)**:
 
 * **CONF-01 – CONF-03:** Lossless storage, SHA-256 round-trip integrity, and deterministic indexing.
 * **CONF-04:** Temporal disambiguation (chronological resolution when configurations evolve across turns).
 * **CONF-05 – CONF-07:** Exact verbatim retrieval, bounded rehydration caps, and single-turn prompt eviction.
 * **CONF-08 – CONF-10:** UI dual-projection isolation, tamper detection, and explicit failure modes.
 * **CONF-11 – CONF-12:** Deterministic replay (projection_sha256) and atomic fold integrity.
+* **CONF-13 (Candidate):** Passive recall interception coverage (Software MMU push-based transparent hydration).
 
-Implementations must satisfy all 12 requirements to claim **`IPCF-1.1 Compliant`** status.
+Implementations must satisfy the test suite to claim **`IPCF-1.1 Compliant`** status.
 
 ---
 
@@ -295,7 +335,7 @@ Implementations must satisfy all 12 requirements to claim **`IPCF-1.1 Compliant`
 | **Sliding Window Attention** | Model-level truncation of old tokens | IPCF is application-level and lossless — discarded content is preserved and retrievable; the model is never unilaterally truncated |
 | **ContextFork (IPSF-1.2)** | Session handoff — transfers context to a new session | IPCF keeps the developer in the *same* session; ContextFold and ContextFork are complementary layers of the ACS stack |
 
-**The IPCF contribution:** The combination of (1) lossless cold storage with SHA-256 verification, (2) deterministic historical addressing enabling exact retrieval without vector similarity, (3) bounded single-turn rehydration preventing context re-bloating, and (4) a vendor-neutral open schema with a formal conformance test suite.
+**The IPCF contribution:** The combination of (1) lossless cold storage with SHA-256 verification, (2) deterministic historical addressing enabling exact retrieval without vector similarity, (3) bounded single-turn rehydration preventing context re-bloating, (4) push-based passive recall interception (Software MMU pattern), and (5) a vendor-neutral open schema with a formal conformance test suite.
 
 ---
 

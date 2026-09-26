@@ -8,7 +8,8 @@ Specification: https://github.com/mrblackman/ContextFold
 
 Commands:
   fold     <step_id> <summary>   Fold (archive) a turn into cold storage.
-  recall   <query>               Recall archived nodes matching a query.
+  scan     <prompt>              Passively scan prompt against recall index (CONF-13 Software MMU).
+  recall   <query>               Recall archived nodes matching a query (pull-based).
   hydrate  <step_id>             Print the exact cold node content for hydration.
   evict    <step_id>             Simulate post-turn eviction (mark as evicted).
   status                         Show current session fold index summary.
@@ -17,6 +18,7 @@ Commands:
 
 Usage:
   python contextfold.py fold 42 "Discussed PostgreSQL port 5433"
+  python contextfold.py scan "Which port did we assign to Postgres?"
   python contextfold.py recall "PostgreSQL port"
   python contextfold.py hydrate 42
   python contextfold.py status
@@ -248,9 +250,14 @@ def _extract_identifiers(text: str) -> list:
     CONF-11: Must be deterministic — same text → same identifiers every run.
     """
     import re
+    STOPWORDS = {
+        "and", "the", "for", "with", "this", "that", "from", "are", "was",
+        "were", "will", "can", "has", "had", "have", "what", "which", "how",
+        "did", "you", "all", "any", "not", "but"
+    }
     words = re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{2,}\b', text)
-    # Normalize to lowercase, deduplicate, sort → deterministic
-    return list(sorted(set(w.lower() for w in words)))
+    # Normalize to lowercase, deduplicate, filter stopwords, sort → deterministic
+    return list(sorted(set(w.lower() for w in words if w.lower() not in STOPWORDS)))
 
 def cmd_recall(query: str) -> None:
     """
@@ -298,6 +305,43 @@ def cmd_recall(query: str) -> None:
         print(f"       Tokens            : {node['token_estimate']}")
         print(f"       Folded            : {node['folded_at']}")
         print()
+
+def cmd_scan(prompt: str) -> list:
+    """
+    CONF-13: Passive Recall Interception (Software MMU Pattern).
+    Simulates the agent harness passively scanning incoming prompt tokens against the recall index.
+    Zero LLM meta-cognition required — automatic push-based page detection.
+    """
+    index = load_index()
+    if not index["nodes"]:
+        print("[SCAN] Recall index is empty.")
+        return []
+
+    tokens = set(_extract_identifiers(prompt))
+    matched_nodes = []
+
+    for step_str, node in index["nodes"].items():
+        node_idents = set(node.get("identifiers", []))
+        intersection = tokens.intersection(node_idents)
+        if intersection:
+            matched_nodes.append((int(step_str), sorted(intersection), node))
+
+    # Rank by match richness (number of matching identifiers DESC), then step_id DESC (chronological latest)
+    matched_nodes.sort(key=lambda x: (-len(x[1]), -x[0]))
+
+    print(f"\n[SCAN (Software MMU - CONF-13)] Passively intercepting incoming prompt:")
+    print(f"  Prompt : '{prompt}'")
+    print(f"  Extracted Tokens : {sorted(tokens)}")
+
+    if matched_nodes:
+        print(f"  ⚡ MMU INTERCEPT: {len(matched_nodes)} candidate historical step(s) matched in index:")
+        for step_id, common_tokens, node in matched_nodes:
+            print(f"     • Step {step_id:>4} (match: {common_tokens}) -> '{node['summary'][:60]}'")
+        print(f"  → Action: Transparently hydrate Step {matched_nodes[0][0]} into active turn prompt before LLM dispatch.")
+    else:
+        print("  ✓ No historical identifier collision. Dispatch directly to LLM without hydration.")
+
+    return matched_nodes
 
 def cmd_hydrate(step_id: int) -> None:
     """
@@ -531,15 +575,20 @@ def cmd_demo() -> None:
     print()
 
     # Status check
-    print("  [2/4] Session status after folding:\n")
+    print("  [2/5] Session status after folding:\n")
     cmd_status()
 
+    # Passive Recall Interception (Software MMU - CONF-13)
+    print("  [3/5] Passive Recall Interception (Software MMU Pattern — CONF-13):")
+    cmd_scan("What port did we configure for PostgreSQL?")
+    print()
+
     # Recall with temporal disambiguation
-    print("  [3/4] Recall: 'PostgreSQL port' — temporal disambiguation (CONF-04):\n")
+    print("  [4/5] Pull-based Recall: 'PostgreSQL port' — temporal disambiguation (CONF-04):\n")
     cmd_recall("PostgreSQL port")
 
     # Hydrate + Evict cycle (CONF-07)
-    print("  [4/4] Bounded rehydration + eviction cycle (CONF-07):\n")
+    print("  [5/5] Bounded rehydration + eviction cycle (CONF-07):\n")
     print("  → Hydrating step 137 (latest PostgreSQL port state)...")
     try:
         cmd_hydrate(137)
@@ -573,6 +622,7 @@ ContextFold — IPCF-1.1 Reference Implementation
 
 Usage:
   python contextfold.py fold     <step_id> <"summary">   Archive a turn
+  python contextfold.py scan     <"prompt">               Passively scan prompt (CONF-13 MMU)
   python contextfold.py recall   <"query">                Query archived nodes (CONF-04)
   python contextfold.py hydrate  <step_id>               Hydrate a cold node (CONF-05/06)
   python contextfold.py evict    <step_id>               Evict after LLM response (CONF-07)
@@ -600,6 +650,13 @@ def main() -> None:
             step_id = int(args[1])
             summary = " ".join(args[2:])
             cmd_fold(step_id, summary)
+
+        elif command == "scan":
+            if len(args) < 2:
+                print("Usage: python contextfold.py scan <prompt>")
+                sys.exit(1)
+            prompt = " ".join(args[1:])
+            cmd_scan(prompt)
 
         elif command == "recall":
             if len(args) < 2:

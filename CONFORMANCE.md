@@ -305,6 +305,34 @@ A future **Repair Protocol** extension MAY define automatic recovery behavior. U
 
 ---
 
+### 4.5. Candidate Requirement `CONF-13`: Passive Recall Interception (Software MMU Pattern)
+
+In modern operating systems, memory paging is **push-based and transparent**: the CPU does not ask the OS to load a missing page; the Memory Management Unit (MMU) intercepts the memory reference, pages the data from swap into RAM, and presents it to the process invisibly.
+
+If an AI agent architecture relies on the model to "realize" that it lacks historical context and explicitly invoke a pull-based tool (`recall_archived_nodes`), it fails in practice due to LLM **meta-cognitive blind spots** (models hallucinate plausible parameters rather than asking for forgotten details).
+
+#### Normative Requirement (Candidate):
+An IPCF-compliant Agent Harness SHOULD implement **push-based passive recall interception** as a software MMU:
+
+1. **Pre-Dispatch Interception (`pre_turn_dispatch`):**
+   Prior to dispatching the user prompt to the LLM, the harness passively tokenizes the incoming text and computes the intersection against the set of `identifiers` across all nodes in `recall_index.json`.
+
+2. **Transparent Page-In:**
+   If one or more candidate nodes match the intersection:
+   - The harness verifies `artifact_sha256` of the candidate node on disk (`CONF-09`).
+   - The harness transparently hydrates the cold node payload into the active turn prompt context.
+   - The LLM receives the prompt with ground truth already present; no meta-cognitive awareness is required.
+
+3. **Post-Turn Eviction:**
+   Upon receiving the LLM's response (`post_turn_response`), the harness MUST evict the hydrated payload, returning active prompt tokens to baseline working memory (`CONF-07`).
+
+#### Pass Criteria:
+- **Test:** Submit a user query mentioning an indexed identifier (e.g. `"5433"` or `"PostgreSQL"`) to a harness running without active LLM tool calling enabled.
+- **Assertion:** The harness MUST intercept the identifier, hydrate Step 137 into prompt memory, and verify that `artifact_sha256` is validated before model dispatch.
+- **Post-condition:** On the following turn, active context token count MUST return to baseline (confirming eviction).
+
+---
+
 ## 🛡️ 5. Conformance Test Verification Harness
 
 Compliant implementations should provide an automated test runner executing this suite. A reference test script structure:
