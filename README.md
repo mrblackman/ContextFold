@@ -40,6 +40,10 @@ To implement IPCF, a hosting agent harness MUST support:
    - `pre_turn_dispatch`: Intercept incoming user prompt, passively scan identifiers against `recall_index.json`, and hydrate matching cold nodes.
    - `post_turn_response`: Execute single-turn prompt eviction (`CONF-07`), pruning hydrated nodes back down to baseline working memory before the subsequent turn.
 
+> 🎨 **Concept mockup — not a screenshot.** This image illustrates the target IDE integration described in [§0 Runtime Assumptions & Integration Surface](#-0-runtime-assumptions--integration-surface). No graphical implementation exists yet — `contextfold.py` is a terminal-only reference CLI (see [§7](#-7-reference-implementation-contextfoldpy)). The UI shown here is a design goal, not a working feature.
+
+![Concept mockup of the target ContextFold IDE integration — illustrative, not a working screenshot](docs/concept-mockup-target-ui.png)
+
 ---
 
 ## 🎯 1. Executive Summary
