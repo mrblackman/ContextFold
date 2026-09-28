@@ -9,6 +9,12 @@
       "type": "string",
       "description": "Specification version string (e.g. '1.1')."
     },
+    "projection_version": {
+      "type": "string",
+      "enum": ["ipcf-projection-v2"],
+      "default": "ipcf-projection-v2",
+      "description": "Projection algorithm version string ('ipcf-projection-v2' active)."
+    },
     "step_id": {
       "type": "integer",
       "description": "Canonical turn index sourced from conversation history."
@@ -30,15 +36,44 @@
       "type": "string",
       "description": "Full verbatim content of the archived turn (lossless, CONF-01)."
     },
+    "normalized_content": {
+      "type": "string",
+      "description": "Source content normalized to UTF-8 NFC with trailing whitespace stripped."
+    },
     "payload_sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
-      "description": "SHA-256 of raw source content before folding. Immutable content identity (CONF-02). MUST remain identical through fold → store → hydrate lifecycle."
+      "description": "SHA-256 of raw source content before folding. Immutable content identity (CONF-02)."
     },
     "projection_sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
-      "description": "SHA-256 of the canonical projection fields in fixed order. Deterministic logical identity (CONF-11). Runtime-independent — same inputs always produce identical hash."
+      "description": "SHA-256 of the 8 canonical projection fields in fixed order. Deterministic logical identity (CONF-11)."
+    },
+    "artifact_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of canonical JSON serialization of cold node with artifact_sha256 omitted/null. Physical serialization integrity (CONF-09)."
+    },
+    "identifiers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Sorted, deduplicated identifiers extracted from turn content."
+    },
+    "files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Sorted, deduplicated file paths referenced in the turn."
+    },
+    "commands": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Sorted, deduplicated shell/tool commands executed in the turn."
+    },
+    "errors": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Sorted, deduplicated error and exception types recorded in the turn."
     },
     "token_estimate": {
       "type": "integer",
@@ -46,7 +81,7 @@
     },
     "sanitized": {
       "type": "boolean",
-      "description": "True if API tokens, passwords, and credentials have been scrubbed before writing to disk. Production implementations MUST set this to true after a regex redaction pass."
+      "description": "True if API tokens, passwords, and credentials have been scrubbed before writing to disk."
     },
     "status": {
       "type": "string",
@@ -85,5 +120,21 @@
       "description": "Code diffs produced during this turn."
     }
   },
-  "required": ["ipcf_version", "step_id", "session_id", "folded_at", "raw_content", "payload_sha256", "projection_sha256", "sanitized"]
+  "required": [
+    "ipcf_version",
+    "projection_version",
+    "step_id",
+    "session_id",
+    "folded_at",
+    "raw_content",
+    "normalized_content",
+    "payload_sha256",
+    "projection_sha256",
+    "artifact_sha256",
+    "identifiers",
+    "files",
+    "commands",
+    "errors",
+    "sanitized"
+  ]
 }

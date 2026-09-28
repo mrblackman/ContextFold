@@ -10,14 +10,14 @@ Commands:
   fold     <step_id> <summary>   Fold (archive) a turn into cold storage.
   scan     <prompt>              Passively scan prompt against recall index (CONF-13 Software MMU).
   recall   <query>               Recall archived nodes matching a query (pull-based).
-  hydrate  <step_id>             Print the exact cold node content for hydration.
-  evict    <step_id>             Simulate post-turn eviction (mark as evicted).
+  hydrate  <step_id>             Print the exact cold node content for hydration (CONF-05/06).
+  evict    <step_id>             Simulate post-turn eviction (CONF-07).
   status                         Show current session fold index summary.
   validate                       Run integrity check on all cold nodes (CONF-02, CONF-09, CONF-12).
   demo                           Simulate a 500-turn session lifecycle.
 
 Usage:
-  python contextfold.py fold 42 "Discussed PostgreSQL port 5433"
+  python contextfold.py fold 42 "Discussed PostgreSQL port 5433" [--file path] [--files f1,f2] [--commands c1,c2] [--errors e1,e2]
   python contextfold.py scan "Which port did we assign to Postgres?"
   python contextfold.py recall "PostgreSQL port"
   python contextfold.py hydrate 42
@@ -28,23 +28,29 @@ Usage:
 
 import sys
 import os
+from pathlib import Path
 import json
 import hashlib
-import shutil
 import tempfile
 import datetime
-import time
+import re
+import unicodedata
 
 # ──────────────────────────────────────────────────────────────
 # Windows encoding safety (CONF-01 lossless I/O)
 # ──────────────────────────────────────────────────────────────
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ──────────────────────────────────────────────────────────────
-# Storage layout
+# Storage layout & Protocol Versions (D-3)
 # ──────────────────────────────────────────────────────────────
+PROJECTION_VERSION = "ipcf-projection-v2"
+
 FOLD_DIR = ".contextfold"
 COLD_NODE_DIR = os.path.join(FOLD_DIR, "cold_nodes")
 INDEX_FILE = os.path.join(FOLD_DIR, "recall_index.json")
@@ -52,64 +58,200 @@ POLICY_FILE = os.path.join(FOLD_DIR, "hydration_policy.json")
 EVICTION_LOG = os.path.join(FOLD_DIR, "eviction_log.json")
 
 # ──────────────────────────────────────────────────────────────
+# 500-Turn Verification Scenario Fixture (D-2, D-5)
+# ──────────────────────────────────────────────────────────────
+DEMO_TURNS = [
+    (37,  "PostgreSQL configured on Port 5433", "$ docker compose up -d postgres\nPostgreSQL running on port 5433"),
+    (91,  "PostgreSQL switched to Port 5434 (conflict resolution)", "$ psql -p 5434 -U admin\nConflict resolved on port 5434"),
+    (137, "PostgreSQL port 5434 reverted back to Port 5433", "$ sed -i 's/5434/5433/' config.env\nPostgreSQL Port 5433 restored"),
+    (200, "Authentication middleware refactored; JWT secret rotated", "JWT secret updated in auth/middleware.py"),
+    (318, "Migration V12 applied to production database", "$ python manage.py migrate V12__TenantBilling.sql\nMigration V12 applied"),
+    (342, "Migration V12 rolled back due to deadlocks", "Deadlock detected in billing table; rolled back V12"),
+    (447, "Migration V12 patched and re-applied successfully", "Patched V12__TenantBilling.sql with row-level locks; migration complete"),
+    (499, "Final review: all services healthy, Port 5433 confirmed", "All health checks passing on port 5433"),
+]
+
+# ──────────────────────────────────────────────────────────────
+# Recall Candidate Model (D-1, D-6)
+# ──────────────────────────────────────────────────────────────
+class RecallCandidate(dict):
+    """
+    Candidate dict returned by cmd_recall.
+    Supports standard dict keys ('step_id', 'status', 'coverage', 'score', 'node')
+    and legacy tuple index lookup [0: step_id, 1: score, 2: node] as a dict adapter (V-3).
+    Note: Does not support sequence unpacking (e.g. step_id, score, node = candidate).
+    """
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            if item == 0:
+                return self["step_id"]
+            elif item == 1:
+                return self["score"]
+            elif item == 2:
+                node = self["node"]
+                node["status"] = self["status"]
+                return node
+        return super().__getitem__(item)
+
+
+# ──────────────────────────────────────────────────────────────
 # Default hydration policy (CONF-06: reference default, not invariant)
 # ──────────────────────────────────────────────────────────────
 DEFAULT_POLICY = {
     "policy_version": "1.1",
-    "max_rehydration_tokens_per_call": 3000,  # reference default — MAY be overridden
+    "max_rehydration_tokens_per_call": 3000,
+    "max_rehydration_tokens_per_turn": 3500,
     "scope": "single_turn",
     "eviction_trigger": "after_response",
     "integrity_verification": True
 }
 
 # ──────────────────────────────────────────────────────────────
-# Errors
+# Errors (CONF-09, CONF-10, CONF-12)
 # ──────────────────────────────────────────────────────────────
 class NodeNotFoundError(Exception):
+    """Raised when a requested step_id is absent from the index (CONF-10)."""
     pass
 
 class IntegrityCheckError(Exception):
+    """Raised when SHA-256 hash verification fails (CONF-09, CONF-12 Scenario C)."""
+    pass
+
+class PathContainmentError(IntegrityCheckError):
+    """Raised when cold storage file path violates canonical boundary or attempts traversal (CONF-12 Path Containment)."""
     pass
 
 class OrphanedNodeError(Exception):
+    """Raised when a cold storage node exists on disk but has no recall index entry (CONF-12 Scenario A)."""
     pass
 
 class BrokenReferenceError(Exception):
+    """Raised when recall index references a cold node file that does not exist on disk (CONF-12 Scenario B)."""
     pass
 
 # ──────────────────────────────────────────────────────────────
-# Helpers
+# Serialization & Canonical Hashing
 # ──────────────────────────────────────────────────────────────
 
+def canonical_json_bytes(data: dict) -> bytes:
+    """
+    Canonical JSON serialization for IPCF-1.1 hashing.
+    sort_keys=True, separators=(',', ':'), ensure_ascii=False, UTF-8 encoded.
+    CONFORMANCE.md §2.3 normative definition.
+    """
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+def sha256_of_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def sha256_of_str(data: str) -> str:
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
 def sha256_of_file(path: str) -> str:
-    """Compute SHA-256 of a file. CONF-02."""
+    """Compute SHA-256 of raw bytes of a file."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
 
-def sha256_of_str(data: str) -> str:
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-def _compute_projection_sha256(step_id: int, normalized_content: str, identifiers: list) -> str:
+def _compute_projection_sha256(
+    step_id: int,
+    normalized_content: str,
+    identifiers: list,
+    files: list,
+    commands: list,
+    errors: list,
+    policy_dict: dict
+) -> str:
     """
     CONF-11: Deterministic Logical Identity — runtime-independent, reproducible.
-    Computed exclusively from the canonical projection fields in a fixed order.
-    Same step_id + same content + same identifiers → identical hash on any machine.
+    Computed strictly from the 8 canonical projection fields in normative order (CONFORMANCE.md §2.2):
+    1. projection_version
+    2. step_id
+    3. normalized_content
+    4. identifiers (sorted)
+    5. files (sorted)
+    6. commands (sorted)
+    7. errors (sorted)
+    8. folding_policy_hash (SHA-256 of canonical JSON of active policy)
     """
-    canonical = json.dumps(
-        {
-            "projection_version": "ipcf-projection-v1",
-            "step_id": step_id,
-            "normalized_content": normalized_content.strip(),
-            "identifiers": sorted(identifiers),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    policy_canonical_hash = sha256_of_bytes(canonical_json_bytes(policy_dict))
+    proj_obj = {
+        "projection_version": PROJECTION_VERSION,
+        "step_id": step_id,
+        "normalized_content": normalized_content.rstrip(),
+        "identifiers": sorted(list(set(identifiers))),
+        "files": sorted(list(set(files))),
+        "commands": sorted(list(set(commands))),
+        "errors": sorted(list(set(errors))),
+        "folding_policy_hash": policy_canonical_hash,
+    }
+    return sha256_of_bytes(canonical_json_bytes(proj_obj))
+
+def _resolve_cold_node_path(step_id: int, node_meta: dict) -> str:
+    """
+    Unconditionally verify and resolve canonical cold node path against path traversal,
+    absolute paths, sibling directory prefixes, and symlink escapes (CONF-12 Path Containment).
+    Runs unconditionally, independent of policy['integrity_verification'].
+    """
+    node_path = node_meta.get("file_path", "")
+    if not node_path:
+        raise PathContainmentError(f"Step {step_id}: Missing file_path in recall_index node metadata.")
+
+    expected_path = cold_node_path(step_id)
+    resolved_node = Path(node_path).resolve()
+    resolved_expected = Path(expected_path).resolve()
+    resolved_cold_dir = Path(COLD_NODE_DIR).resolve()
+
+    if resolved_node != resolved_expected or resolved_node.parent != resolved_cold_dir:
+        raise PathContainmentError(
+            f"PathContainmentError: Cold node path '{node_path}' violates canonical boundary or does not match expected '{expected_path}' for step {step_id}."
+        )
+    return str(resolved_expected)
+
+def verify_artifact(path: str, expected_hash: str = None) -> tuple[bool, dict, str]:
+    """
+    Verify canonical physical on-disk serialization integrity (CONF-09, CONF-12).
+    Two-Phase Verification:
+      1. Read cold node JSON.
+      2. Extract stored artifact_sha256.
+      3. Construct canonical representation with artifact_sha256 omitted.
+      4. Compute SHA-256 and assert stored_hash == computed_hash (and == expected_hash if provided).
+    """
+    if not os.path.exists(path):
+        raise BrokenReferenceError(f"Cold node file not found: {path} (CONF-12 Scenario B)")
+
+    try:
+        data = load_json(path)
+    except (json.JSONDecodeError, ValueError) as err:
+        raise IntegrityCheckError(f"Corrupted or truncated JSON in cold node file: {path} (CONF-12 Scenario C)") from err
+
+    stored_hash = data.get("artifact_sha256")
+    if not stored_hash:
+        raise IntegrityCheckError(f"Missing artifact_sha256 in cold node file: {path} (CONF-09)")
+
+    # Phase 1 shape: object without artifact_sha256
+    verify_obj = {k: v for k, v in data.items() if k != "artifact_sha256"}
+    computed_hash = sha256_of_bytes(canonical_json_bytes(verify_obj))
+
+    if stored_hash != computed_hash:
+        raise IntegrityCheckError(
+            f"IntegrityCheckError: artifact_sha256 mismatch for {path}.\n"
+            f"  Stored in file : {stored_hash}\n"
+            f"  Computed       : {computed_hash}\n"
+            f"  (CONF-09 / CONF-12 Scenario C)"
+        )
+
+    if expected_hash and stored_hash != expected_hash:
+        raise IntegrityCheckError(
+            f"IntegrityCheckError: artifact_sha256 does not match recall_index for {path}.\n"
+            f"  Index expected: {expected_hash}\n"
+            f"  File stored   : {stored_hash}\n"
+            f"  (CONF-09 / CONF-12 Scenario C)"
+        )
+
+    return True, data, computed_hash
 
 def atomic_write_json(path: str, data: dict) -> None:
     """Write JSON atomically via temp-file-then-rename. CONF-12 (Atomic Fold)."""
@@ -118,7 +260,7 @@ def atomic_write_json(path: str, data: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
-        os.replace(tmp_path, path)  # atomic on POSIX; best-effort on Windows
+        os.replace(tmp_path, path)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -135,7 +277,12 @@ def ensure_dirs() -> None:
 
 def load_index() -> dict:
     if not os.path.exists(INDEX_FILE):
-        return {"ipcf_version": "1.1", "nodes": {}, "created_at": _iso_now()}
+        return {
+            "ipcf_version": "1.1",
+            "projection_version": PROJECTION_VERSION,
+            "nodes": {},
+            "created_at": _iso_now()
+        }
     return load_json(INDEX_FILE)
 
 def save_index(index: dict) -> None:
@@ -143,7 +290,7 @@ def save_index(index: dict) -> None:
 
 def load_policy() -> dict:
     if not os.path.exists(POLICY_FILE):
-        return DEFAULT_POLICY
+        return dict(DEFAULT_POLICY)
     return load_json(POLICY_FILE)
 
 def load_eviction_log() -> dict:
@@ -166,70 +313,167 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 # ──────────────────────────────────────────────────────────────
+# Deterministic Heuristic Extractors (Z-3, Z-4, Y-3, Y-5)
+# ──────────────────────────────────────────────────────────────
+
+def _fold_token(w: str) -> str:
+    """
+    NFC normalize, lowercase, strip combining dot above (U+0307), and fold Turkish dotless i (D-4).
+    Deterministic token folding for identifiers and recall matching.
+    """
+    normalized = unicodedata.normalize("NFC", w.lower())
+    return normalized.replace("\u0307", "").replace("ı", "i")
+
+ENGLISH_STOPWORDS = {
+    "and", "the", "for", "with", "this", "that", "from", "are", "was",
+    "were", "will", "can", "has", "had", "have", "what", "which", "how",
+    "did", "you", "all", "any", "not", "but",
+    # 2-letter common English words to avoid noise (Z-3)
+    "we", "is", "it", "on", "at", "to", "of", "in", "do", "be", "or",
+    "an", "as", "if", "by", "so", "no", "up", "my"
+}
+
+TURKISH_STOPWORDS = {
+    "ve", "ile", "için", "olan", "bir", "bu", "şu", "daha", "gibi",
+    "kadar", "diye", "veya", "ya", "ama", "fakat", "lakin", "çünkü",
+    "böyle", "nasıl", "neden", "ne", "hangi", "var", "yok", "şey",
+    "mi", "mu", "mü", "mı"
+}
+
+STOPWORDS = {
+    _fold_token(w) for w in (ENGLISH_STOPWORDS | TURKISH_STOPWORDS)
+} | ENGLISH_STOPWORDS | TURKISH_STOPWORDS
+
+def _extract_files(text: str) -> list[str]:
+    pattern = r'(?:[\w.-]+[/\\])+[\w.-]+\.[a-zA-Z0-9]+|[\w.-]+\.(?:py|js|ts|json|md|sql|sh|yml|yaml|html|css|rs|go|cs)'
+    matches = re.findall(pattern, text)
+    return sorted(list(set(m.replace('\\', '/') for m in matches)))
+
+def _extract_commands(text: str) -> list[str]:
+    # Y-3: re.MULTILINE with $ or > prompt symbols
+    pattern = r'^\s*(?:\$|>)\s*([a-zA-Z0-9_.-]+(?:\s+[^;\n\r]+)?)'
+    matches = re.findall(pattern, text, re.MULTILINE)
+    return sorted(list(set(m.strip() for m in matches if m.strip())))
+
+def _extract_errors(text: str) -> list[str]:
+    pattern = r'\b(?:[A-Z][a-zA-Z0-9]+Error|[A-Z][a-zA-Z0-9]+Exception|FATAL|PANIC|Traceback)\b|HTTP\s+[45]\d{2}|\b[A-Z]{2,}_[A-Z0-9_]+_ERROR\b'
+    matches = re.findall(pattern, text)
+    return sorted(list(set(matches)))
+
+def _extract_identifiers(text: str) -> list[str]:
+    # D-3a: Starts with letter or underscore, 3+ chars: r'\b[^\W\d]\w{2,}\b'
+    # Or numbers 3+ digits: r'\b[0-9]{3,}\b'
+    # Unicode word support (N-3) and Turkish case-folding (D-4)
+    text_nfc = unicodedata.normalize("NFC", text)
+    pattern = r'\b[^\W\d]\w{2,}\b|\b[0-9]{3,}\b'
+    matches = re.findall(pattern, text_nfc)
+    folded = [_fold_token(w) for w in matches]
+    return sorted(list(set(w for w in folded if w not in STOPWORDS)))
+
+# ──────────────────────────────────────────────────────────────
 # Core Engine
 # ──────────────────────────────────────────────────────────────
 
-def cmd_fold(step_id: int, summary: str, raw_content: str = None, session_id: str = None) -> None:
+def cmd_fold(
+    step_id: int,
+    summary: str,
+    raw_content: str = None,
+    session_id: str = None,
+    files: list = None,
+    commands: list = None,
+    errors: list = None
+) -> dict:
     """
     Fold (archive) a turn into cold storage.
 
-    Phase 1: Write cold node to disk (atomic).
-    Phase 2: Update recall index (atomic).
-    CONF-12: If crash between phases, orphaned node is detectable on next validate.
-    CONF-11: Deterministic output — no uuid4(), no datetime in index keys.
-
-    Three Hash Identities (CONFORMANCE.md §2):
-      payload_sha256    — immutable content identity (CONF-02)
-      projection_sha256 — deterministic logical identity (CONF-11)
-      artifact_sha256   — physical on-disk serialization identity (CONF-09)
+    Two-Phase Write Protocol (CONFORMANCE.md §2.3):
+      Phase 1: Compute payload_sha256, 8-field projection_sha256, and canonical artifact_sha256.
+      Phase 2: Atomic write cold node with artifact_sha256 included; update recall_index.json.
     """
     ensure_dirs()
     index = load_index()
 
     if str(step_id) in index["nodes"]:
         print(f"[WARN] Step {step_id} already folded. Skipping.")
-        return
+        return index["nodes"][str(step_id)]
 
     payload_text = raw_content or summary
-    normalized_content = payload_text.strip()
+    summary_nfc = unicodedata.normalize("NFC", summary)
+    payload_nfc = unicodedata.normalize("NFC", payload_text)
+    normalized_content = payload_nfc.rstrip()
 
-    # Three hash identities
+    policy = load_policy()
+
+    # Extract or take explicit fields (W-4b: use NFC normalized text for deterministic extraction)
+    combined_text = f"{summary_nfc}\n{payload_nfc}"
+    extracted_files = files if files is not None else _extract_files(combined_text)
+    extracted_commands = commands if commands is not None else _extract_commands(combined_text)
+    extracted_errors = errors if errors is not None else _extract_errors(combined_text)
+    extracted_identifiers = _extract_identifiers(combined_text)
+
+    # Three hash identities (CONF-02 preserves raw payload for payload_sha256)
     payload_sha256 = sha256_of_str(payload_text)
-    identifiers = _extract_identifiers(summary)
-    projection_sha256 = _compute_projection_sha256(step_id, normalized_content, identifiers)
+    projection_sha256 = _compute_projection_sha256(
+        step_id=step_id,
+        normalized_content=normalized_content,
+        identifiers=extracted_identifiers,
+        files=extracted_files,
+        commands=extracted_commands,
+        errors=extracted_errors,
+        policy_dict=policy
+    )
 
-    cold_node = {
+    created_iso = _iso_now()
+
+    # Construct Phase 1 cold node object (artifact_sha256 absent)
+    cold_node_pre = {
         "ipcf_version": "1.1",
+        "projection_version": PROJECTION_VERSION,
         "step_id": step_id,
         "session_id": session_id or "default-session",
-        "folded_at": _iso_now(),
+        "folded_at": created_iso,
         "summary": summary,
         "raw_content": payload_text,
-        "payload_sha256": payload_sha256,       # CONF-02: immutable content identity
-        "projection_sha256": projection_sha256, # CONF-11: deterministic logical identity
+        "normalized_content": normalized_content,
+        "payload_sha256": payload_sha256,
+        "projection_sha256": projection_sha256,
+        "identifiers": extracted_identifiers,
+        "files": extracted_files,
+        "commands": extracted_commands,
+        "errors": extracted_errors,
         "token_estimate": _estimate_tokens(payload_text),
-        "sanitized": False,  # Reference impl: secret scrubbing not implemented.
-                             # Production MUST set True after regex redaction pass.
+        "sanitized": False,
         "status": "cold"
     }
 
+    # Phase 1: Compute artifact_sha256 over canonical serialization
+    artifact_sha256 = sha256_of_bytes(canonical_json_bytes(cold_node_pre))
+
+    # Phase 2: Insert artifact_sha256 and persist atomically
+    cold_node = dict(cold_node_pre)
+    cold_node["artifact_sha256"] = artifact_sha256
+
     node_path = cold_node_path(step_id)
-
-    # Phase 1 — write cold node (atomic)
     atomic_write_json(node_path, cold_node)
-    artifact_sha256 = sha256_of_file(node_path)  # CONF-09: physical on-disk identity
 
-    # Phase 2 — update recall index (atomic)
+    # Use POSIX forward slashes for portability
+    posix_node_path = node_path.replace("\\", "/")
+
+    # Update recall index
     index["nodes"][str(step_id)] = {
         "step_id": step_id,
+        "projection_version": PROJECTION_VERSION,
         "summary": summary,
         "payload_sha256": payload_sha256,
         "projection_sha256": projection_sha256,
         "artifact_sha256": artifact_sha256,
-        "file_path": node_path,
+        "file_path": posix_node_path,
         "token_estimate": cold_node["token_estimate"],
-        "folded_at": cold_node["folded_at"],
-        "identifiers": sorted(identifiers),   # sorted → CONF-11 determinism
+        "folded_at": created_iso,
+        "identifiers": extracted_identifiers,
+        "files": extracted_files,
+        "commands": extracted_commands,
+        "errors": extracted_errors,
         "evicted": False
     }
     save_index(index)
@@ -240,65 +484,103 @@ def cmd_fold(step_id: int, summary: str, raw_content: str = None, session_id: st
     print(f"  projection_sha256 : {projection_sha256[:16]}…")
     print(f"  artifact_sha256   : {artifact_sha256[:16]}…")
     print(f"  Tokens est.       : {cold_node['token_estimate']}")
-    print(f"  File              : {node_path}")
+    print(f"  File              : {posix_node_path}")
 
+    return cold_node
 
-def _extract_identifiers(text: str) -> list:
-    """
-    Naive keyword extractor for recall index.
-    Production: replace with NLP entity extractor.
-    CONF-11: Must be deterministic — same text → same identifiers every run.
-    """
-    import re
-    STOPWORDS = {
-        "and", "the", "for", "with", "this", "that", "from", "are", "was",
-        "were", "will", "can", "has", "had", "have", "what", "which", "how",
-        "did", "you", "all", "any", "not", "but"
-    }
-    words = re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{2,}\b', text)
-    # Normalize to lowercase, deduplicate, filter stopwords, sort → deterministic
-    return list(sorted(set(w.lower() for w in words if w.lower() not in STOPWORDS)))
-
-def cmd_recall(query: str) -> None:
+def cmd_recall(query: str) -> list[RecallCandidate]:
     """
     Recall archived nodes matching query.
-    CONF-04: Temporal disambiguation — candidates sorted chronologically.
+    CONF-04: Temporal disambiguation via Coverage Tiering + Chronological Ranking (D-1, D-6).
     CONF-05: Returns exact stored metadata; no LLM re-interpretation.
     """
     index = load_index()
     if not index["nodes"]:
         print("[RECALL] No folded nodes found.")
-        return
+        return []
 
-    query_lower = query.lower().split()
+    # D-4, V-1: NFC normalize and extract normalized tokens via exact term semantics
+    query_nfc = unicodedata.normalize("NFC", query)
+    query_tokens = set(_extract_identifiers(query_nfc))
+    all_query_terms = query_tokens
+
     candidates = []
 
     for step_str, node in index["nodes"].items():
+        step_id = int(step_str)
+        summary_tokens = set(_extract_identifiers(unicodedata.normalize("NFC", node.get("summary", ""))))
+        indexed_terms = (
+            set(node.get("identifiers", [])) |
+            set(_fold_token(f) for f in node.get("files", [])) |
+            set(_fold_token(e) for e in node.get("errors", []))
+        )
+        
+        # Calculate coverage: distinct query terms matched with exact term semantics (V-1)
+        matched_query_terms = set()
         score = 0
-        summary_lower = node["summary"].lower()
-        for token in query_lower:
-            if token in summary_lower:
+        for token in all_query_terms:
+            matched = False
+            if token in summary_tokens:
                 score += 2
-            if any(token in ident for ident in node.get("identifiers", [])):
+                matched = True
+            if token in indexed_terms:
                 score += 1
-        if score > 0:
-            candidates.append((node["step_id"], score, node))
+                matched = True
+            if matched:
+                matched_query_terms.add(token)
+
+        coverage = len(matched_query_terms)
+        if coverage > 0 or score > 0:
+            candidates.append(RecallCandidate({
+                "step_id": step_id,
+                "score": score,
+                "coverage": coverage,
+                "status": "pending",
+                "node": node
+            }))
 
     if not candidates:
         print(f"[RECALL] No matching nodes for query: '{query}'")
-        return
+        return []
 
-    # Sort: primary=score DESC, secondary=step_id DESC (temporal, latest first)
-    # CONF-04: chronological ranking, latest state clearly distinguished
-    candidates.sort(key=lambda x: (-x[1], -x[0]))
+    # D-1: Coverage Tiering
+    max_coverage = max(c["coverage"] for c in candidates)
+    primary_tier = [c for c in candidates if c["coverage"] == max_coverage]
+    secondary_tier = [c for c in candidates if c["coverage"] < max_coverage]
+
+    # Sort each tier chronologically (latest first: step_id DESC)
+    primary_tier.sort(key=lambda x: -x["step_id"])
+    secondary_tier.sort(key=lambda x: -x["step_id"])
+
+    # D-6: Normative status labels (CONFORMANCE.md §4.1)
+    n_primary = len(primary_tier)
+    for i, c in enumerate(primary_tier):
+        if n_primary == 1:
+            c["status"] = "latest_chronological"
+        elif n_primary == 2:
+            c["status"] = "latest_chronological" if i == 0 else "historical"
+        else: # n >= 3
+            if i == 0:
+                c["status"] = "latest_chronological"
+            elif i == n_primary - 1:
+                c["status"] = "historical"
+            else:
+                c["status"] = "superseded"
+
+    for c in secondary_tier:
+        c["status"] = "related"
+
+    ordered_candidates = primary_tier + secondary_tier
 
     print(f"\n[RECALL] Query: '{query}'")
-    print(f"  Found {len(candidates)} candidate(s) — chronological (latest first):\n")
+    print(f"  Found {len(ordered_candidates)} candidate(s) — coverage tiered & chronological (latest first):\n")
 
-    for rank, (step_id, score, node) in enumerate(candidates):
-        status_label = "latest_chronological" if rank == 0 else "historical"
+    for rank, c in enumerate(ordered_candidates):
+        step_id = c["step_id"]
+        node = c["node"]
+        status_label = c["status"]
         evicted_note = " [EVICTED]" if node.get("evicted") else ""
-        print(f"  [{rank+1}] Step {step_id:>4}  |  score={score}  |  {status_label}{evicted_note}")
+        print(f"  [{rank+1}] Step {step_id:>4}  |  coverage={c['coverage']}  score={c['score']}  |  {status_label}{evicted_note}")
         print(f"       Summary           : {node['summary'][:80]}")
         print(f"       payload_sha256    : {node['payload_sha256'][:16]}…")
         print(f"       projection_sha256 : {node.get('projection_sha256', 'N/A')[:16]}…")
@@ -306,91 +588,147 @@ def cmd_recall(query: str) -> None:
         print(f"       Folded            : {node['folded_at']}")
         print()
 
+    return ordered_candidates
+
 def cmd_scan(prompt: str) -> list:
     """
-    CONF-13: Passive Recall Interception (Software MMU Pattern).
-    Simulates the agent harness passively scanning incoming prompt tokens against the recall index.
-    Zero LLM meta-cognition required — automatic push-based page detection.
+    CONF-13 / Invariant 4: Software MMU Passive Recall via Residual Greedy Set Cover (RGSC).
+    Extracts identifiers, files, errors from prompt and matches against indexed terms.
+    Applies Intent Ownership (S-1) and tie-breaking (R-4) under turn token budget.
+    Returns list of (step_id, matched_tokens, node) ordered by selection priority.
     """
     index = load_index()
+    policy = load_policy()
     if not index["nodes"]:
         print("[SCAN] Recall index is empty.")
         return []
 
-    tokens = set(_extract_identifiers(prompt))
-    matched_nodes = []
+    prompt_nfc = unicodedata.normalize("NFC", prompt)
+    prompt_tokens = set(_extract_identifiers(prompt_nfc))
+    prompt_files = set(_fold_token(f) for f in _extract_files(prompt_nfc))
+    prompt_errors = set(_fold_token(e) for e in _extract_errors(prompt_nfc))
+    all_query_tokens = prompt_tokens | prompt_files | prompt_errors
 
+    matched_candidates = []
     for step_str, node in index["nodes"].items():
-        node_idents = set(node.get("identifiers", []))
-        intersection = tokens.intersection(node_idents)
+        node_terms = (
+            set(node.get("identifiers", [])) |
+            set(_fold_token(f) for f in node.get("files", [])) |
+            set(_fold_token(e) for e in node.get("errors", []))
+        )
+        intersection = all_query_tokens.intersection(node_terms)
         if intersection:
-            matched_nodes.append((int(step_str), sorted(intersection), node))
+            matched_candidates.append((int(step_str), intersection, node, node_terms))
 
-    # Rank by match richness (number of matching identifiers DESC), then step_id DESC (chronological latest)
-    matched_nodes.sort(key=lambda x: (-len(x[1]), -x[0]))
+    # Initial sort: match richness DESC, step_id DESC (D-1)
+    matched_candidates.sort(key=lambda x: (-len(x[1]), -x[0]))
+
+    residual = set(all_query_tokens)
+    budget_limit = policy.get("max_rehydration_tokens_per_turn", DEFAULT_POLICY["max_rehydration_tokens_per_turn"])
+    max_per_call = policy.get("max_rehydration_tokens_per_call", DEFAULT_POLICY["max_rehydration_tokens_per_call"])
+    consumed_tokens = 0
+    selected_results = []
+    selected_ids = set()
+    budget_dropped = []
+
+    # RGSC selection with Intent Ownership (S-1) & Tie-Breaking (R-4)
+    while residual:
+        best_candidate = None
+        best_gain = 0
+        best_step_id = -1
+
+        for step_id, _, node, node_terms in matched_candidates:
+            if step_id in selected_ids:
+                continue
+            gain = len(residual & node_terms)
+            if gain == 0:
+                continue
+            if (gain > best_gain) or (gain == best_gain and step_id > best_step_id):
+                best_gain = gain
+                best_step_id = step_id
+                best_candidate = (step_id, sorted(list(residual & node_terms)), node, node_terms)
+
+        if best_candidate is None:
+            break
+
+        step_id, matched_residual, node, node_terms = best_candidate
+        cost = min(node.get("token_estimate", 0), max_per_call, budget_limit)
+
+        # S-1 Intent Ownership:
+        # First candidate is ALWAYS admitted (clipped by per-call/per-turn limit)
+        # Subsequent candidates must fit within remaining turn budget
+        if len(selected_results) == 0 or (consumed_tokens + cost <= budget_limit):
+            selected_results.append((step_id, matched_residual, node))
+            selected_ids.add(step_id)
+            consumed_tokens += cost
+            residual -= node_terms
+        else:
+            # Exceeds budget: drop terms so superseded/stale steps cannot steal the intent!
+            residual -= node_terms
+            budget_dropped.append((step_id, matched_residual, cost))
 
     print(f"\n[SCAN (Software MMU - CONF-13)] Passively intercepting incoming prompt:")
     print(f"  Prompt : '{prompt}'")
-    print(f"  Extracted Tokens : {sorted(tokens)}")
+    print(f"  Extracted Tokens : {sorted(list(all_query_tokens))}")
 
-    if matched_nodes:
-        print(f"  ⚡ MMU INTERCEPT: {len(matched_nodes)} candidate historical step(s) matched in index:")
-        for step_id, common_tokens, node in matched_nodes:
-            print(f"     • Step {step_id:>4} (match: {common_tokens}) -> '{node['summary'][:60]}'")
-        print(f"  → Action: Transparently hydrate Step {matched_nodes[0][0]} into active turn prompt before LLM dispatch.")
+    if selected_results:
+        print(f"  ⚡ MMU INTERCEPT: {len(matched_candidates)} candidate historical step(s) matched in index:")
+        for step_id, common_tokens, node, _ in matched_candidates:
+            status_mark = " [SELECTED]" if step_id in selected_ids else ""
+            print(f"     • Step {step_id:>4} (match: {sorted(list(common_tokens))}) -> '{node['summary'][:60]}'{status_mark}")
+        hydrated_ids_str = ", ".join(str(s[0]) for s in selected_results)
+        print(f"  → Action: Transparently hydrate Step(s) {hydrated_ids_str} into active turn prompt before LLM dispatch.")
+        if budget_dropped:
+            for step_id, terms, cost in budget_dropped:
+                print(f"  [BUDGET DROPPED] Step {step_id} (terms: {terms}, cost: {cost}) dropped — exceeded turn budget.")
     else:
         print("  ✓ No historical identifier collision. Dispatch directly to LLM without hydration.")
 
-    return matched_nodes
+    return selected_results
 
-def cmd_hydrate(step_id: int) -> None:
+def cmd_hydrate(step_id: int) -> dict:
     """
     Hydrate a cold node into the active prompt.
-
-    CONF-02: Verify SHA-256 before hydrating (integrity_verification).
-    CONF-05: Direct I/O — exact verbatim content, no re-interpretation.
-    CONF-06: Token cap check (bounded rehydration).
-    CONF-09: Raise IntegrityCheckError on mismatch.
-    CONF-10: Raise NodeNotFoundError if step not in index.
+    Returns the loaded cold node dict.
+    
+    CONTRACT (D-8 / Invariant 4):
+      - 'content' is the ONLY field intended for prompt injection (bounded by policy cap).
+      - 'raw_content' preserves verbatim original payload on disk for verification (CONF-01/02).
+        Harnesses MUST NOT inject raw_content directly into LLM prompt.
+    CONF-02, CONF-05, CONF-06, CONF-09, CONF-10.
     """
     index = load_index()
     policy = load_policy()
 
     node_meta = index["nodes"].get(str(step_id))
     if node_meta is None:
+        node_path = cold_node_path(step_id)
+        if os.path.exists(node_path):
+            raise OrphanedNodeError(f"Step {step_id} exists on disk as an orphaned cold node but is not indexed in recall_index. (CONF-12 Scenario A)")
         raise NodeNotFoundError(f"Step {step_id} not found in recall index. (CONF-10)")
 
-    node_path = node_meta["file_path"]
-    if not os.path.exists(node_path):
-        raise BrokenReferenceError(
-            f"Broken reference: recall index references {node_path} but file does not exist. (CONF-12 Scenario B)"
-        )
+    node_path = _resolve_cold_node_path(step_id, node_meta)
 
-    # Integrity check — CONF-02, CONF-09
+    # Canonical artifact integrity verification (Y-1)
     if policy.get("integrity_verification", True):
-        actual_sha = sha256_of_file(node_path)
-        expected_sha = node_meta["artifact_sha256"]
-        if actual_sha != expected_sha:
-            raise IntegrityCheckError(
-                f"IntegrityCheckError: artifact_sha256 mismatch for step {step_id}.\n"
-                f"  Expected : {expected_sha}\n"
-                f"  Actual   : {actual_sha}\n"
-                f"  (CONF-09 / CONF-12 Scenario C)"
-            )
-
-    cold_node = load_json(node_path)
+        _, cold_node, _ = verify_artifact(node_path, expected_hash=node_meta["artifact_sha256"])
+    else:
+        cold_node = load_json(node_path)
     content = cold_node["raw_content"]
     token_estimate = _estimate_tokens(content)
 
-    # Token cap — CONF-06
+    # Token cap — CONF-06 (W-1: Bounded rehydration enforced at return level)
     max_tokens = policy.get("max_rehydration_tokens_per_call", DEFAULT_POLICY["max_rehydration_tokens_per_call"])
+    truncated = False
     if token_estimate > max_tokens:
-        truncation_point = max_tokens * 4  # chars
+        truncation_point = max_tokens * 4
         content = content[:truncation_point]
+        token_estimate = max_tokens
+        truncated = True
         print(f"[WARN] Content truncated to {max_tokens} tokens (policy cap). (CONF-06)")
 
     print(f"\n[HYDRATE] Step {step_id} — exact verbatim content:")
-    print(f"  Token estimate    : {min(token_estimate, max_tokens)}")
+    print(f"  Token estimate    : {token_estimate}")
     print(f"  payload_sha256    : {cold_node['payload_sha256'][:16]}…")
     print(f"  Scope             : {policy.get('scope', 'single_turn')} (evict after response)")
     print()
@@ -400,10 +738,19 @@ def cmd_hydrate(step_id: int) -> None:
     print(f"\n[HYDRATE] Eviction trigger: {policy.get('eviction_trigger', 'after_response')}")
     print(f"  → Call `python contextfold.py evict {step_id}` after LLM response to comply with CONF-07.")
 
-def cmd_evict(step_id: int) -> None:
+    hydrated_result = dict(cold_node)
+    hydrated_result["content"] = content          # Bounded prompt payload (CONF-06)
+    hydrated_result["raw_content"] = cold_node["raw_content"]  # Verbatim disk payload (CONF-01/02)
+    hydrated_result["token_estimate"] = token_estimate
+    hydrated_result["truncated"] = truncated
+
+    return hydrated_result
+
+def cmd_evict(step_id: int) -> dict:
     """
-    Mark a hydrated node as evicted (simulates post-turn eviction).
+    Mark a hydrated node as evicted and record the eviction event in eviction_log.json (Z-5).
     CONF-07: Enforced eviction — no cumulative creep.
+    Returns eviction event record dict: {"step_id": step_id, "evicted_at": timestamp} (D-7).
     """
     index = load_index()
     node_meta = index["nodes"].get(str(step_id))
@@ -411,20 +758,21 @@ def cmd_evict(step_id: int) -> None:
     if node_meta is None:
         raise NodeNotFoundError(f"Step {step_id} not found in recall index.")
 
-    if node_meta.get("evicted"):
-        print(f"[EVICT] Step {step_id} already marked as evicted.")
-        return
-
     index["nodes"][str(step_id)]["evicted"] = True
     save_index(index)
 
+    evicted_at = _iso_now()
+    eviction_event = {"step_id": step_id, "evicted_at": evicted_at}
+
+    # Z-5: Always append to eviction log as a per-turn event
     eviction_log = load_eviction_log()
-    eviction_log["evicted"].append({"step_id": step_id, "evicted_at": _iso_now()})
+    eviction_log["evicted"].append(eviction_event)
     save_eviction_log(eviction_log)
 
     print(f"[EVICT] Step {step_id} evicted from active prompt. Cold storage preserved. (CONF-07)")
+    return eviction_event
 
-def cmd_status() -> None:
+def cmd_status() -> dict:
     """
     Show current session fold index summary.
     """
@@ -464,12 +812,19 @@ def cmd_status() -> None:
                   f"|  {evicted_flag}  |  {node['summary'][:50]}")
     print()
 
-def cmd_validate() -> None:
+    return {
+        "total": total,
+        "active": active_count,
+        "evicted": evicted_count,
+        "total_tokens": total_tokens
+    }
+
+def cmd_validate(exit_on_error: bool = True) -> bool:
     """
     Run integrity check on all cold nodes.
     CONF-02: SHA-256 round-trip.
-    CONF-09: Tamper detection.
-    CONF-12: Orphaned nodes + broken references.
+    CONF-09: Tamper detection via verify_artifact.
+    CONF-12: Orphaned nodes (Scenario A) + broken references (Scenario B).
     """
     ensure_dirs()
     index = load_index()
@@ -488,7 +843,13 @@ def cmd_validate() -> None:
     # 1. Check all indexed nodes (CONF-02, CONF-09, CONF-12 Scenario B & C)
     for step_str, node_meta in sorted(nodes.items(), key=lambda x: int(x[0])):
         step_id = int(step_str)
-        node_path = node_meta.get("file_path", cold_node_path(step_id))
+        try:
+            node_path = _resolve_cold_node_path(step_id, node_meta)
+        except PathContainmentError as err:
+            msg = f"CONF-12 Path Containment — {err}"
+            errors.append(msg)
+            print(f"  [FAIL] Step {step_id:>4}: {msg}")
+            continue
 
         if not os.path.exists(node_path):
             msg = f"CONF-12 Scenario B — Broken reference: step {step_id} in index but file missing: {node_path}"
@@ -497,11 +858,10 @@ def cmd_validate() -> None:
             continue
 
         if policy.get("integrity_verification", True):
-            actual_sha = sha256_of_file(node_path)
-            expected_sha = node_meta.get("artifact_sha256", "")
-            if actual_sha != expected_sha:
-                msg = (f"CONF-09 / CONF-12 Scenario C — artifact_sha256 mismatch for step {step_id}. "
-                       f"Expected={expected_sha[:16]}… Actual={actual_sha[:16]}…")
+            try:
+                verify_artifact(node_path, expected_hash=node_meta.get("artifact_sha256"))
+            except IntegrityCheckError as err:
+                msg = f"CONF-09 / CONF-12 Scenario C — {err}"
                 errors.append(msg)
                 print(f"  [FAIL] Step {step_id:>4}: {msg}")
                 continue
@@ -511,9 +871,7 @@ def cmd_validate() -> None:
 
     # 2. Detect orphaned cold nodes (CONF-12 Scenario A)
     if os.path.isdir(COLD_NODE_DIR):
-        indexed_steps = {
-            int(s) for s in nodes.keys()
-        }
+        indexed_steps = {int(s) for s in nodes.keys()}
         for fname in sorted(os.listdir(COLD_NODE_DIR)):
             if fname.startswith("step_") and fname.endswith(".json"):
                 try:
@@ -529,16 +887,19 @@ def cmd_validate() -> None:
     print()
     if not errors:
         print(f"  Validation PASSED — {pass_count} node(s) verified. IPCF-1.1 integrity confirmed.")
-        sys.exit(0)
+        if exit_on_error:
+            sys.exit(0)
+        return True
     else:
         print(f"  Validation FAILED — {len(errors)} error(s), {pass_count} passed.")
         print()
         print("  Error summary:")
         for e in errors:
             print(f"    • {e}")
-    print()
-    if errors:
-        sys.exit(1)
+        print()
+        if exit_on_error:
+            sys.exit(1)
+        return False
 
 def cmd_demo() -> None:
     """
@@ -554,40 +915,25 @@ def cmd_demo() -> None:
 
     ensure_dirs()
 
-    # --- Build a mini scenario from the CONFORMANCE spec ---
-    demo_turns = [
-        (37,  "PostgreSQL configured on Port 5433"),
-        (91,  "PostgreSQL switched to Port 5434 (conflict resolution)"),
-        (137, "Port 5434 reverted back to Port 5433"),
-        (200, "Authentication middleware refactored; JWT secret rotated"),
-        (318, "Migration V12 applied to production database"),
-        (342, "Migration V12 rolled back due to deadlocks"),
-        (447, "Migration V12 patched and re-applied successfully"),
-        (499, "Final review: all services healthy, Port 5433 confirmed"),
-    ]
-
-    # Fold all demo turns
-    print("  [1/4] Folding 8 representative turns from a 500-turn session...\n")
-    for step_id, summary in demo_turns:
-        raw = f"[Turn {step_id}] {summary}"
+    print("  [1/5] Folding 8 representative turns from a 500-turn session...\n")
+    for step_id, summary, raw in DEMO_TURNS:
         print(f"  → Folding step {step_id}: {summary[:60]}")
         cmd_fold(step_id, summary, raw_content=raw)
     print()
 
-    # Status check
     print("  [2/5] Session status after folding:\n")
     cmd_status()
 
-    # Passive Recall Interception (Software MMU - CONF-13)
     print("  [3/5] Passive Recall Interception (Software MMU Pattern — CONF-13):")
     cmd_scan("What port did we configure for PostgreSQL?")
     print()
+    print("  → Multi-intent showcase query (README §6):")
+    cmd_scan("What port are we using for PostgreSQL, and which migration applied the billing table?")
+    print()
 
-    # Recall with temporal disambiguation
     print("  [4/5] Pull-based Recall: 'PostgreSQL port' — temporal disambiguation (CONF-04):\n")
     cmd_recall("PostgreSQL port")
 
-    # Hydrate + Evict cycle (CONF-07)
     print("  [5/5] Bounded rehydration + eviction cycle (CONF-07):\n")
     print("  → Hydrating step 137 (latest PostgreSQL port state)...")
     try:
@@ -599,18 +945,19 @@ def cmd_demo() -> None:
     print("  → LLM response generated. Now evicting step 137 from active prompt...")
     cmd_evict(137)
 
-    # Validate integrity
     print()
     print("  [VALIDATE] Running full integrity check...\n")
-    cmd_validate()
+    # Z-4 refactor: exit_on_error=False so demo reaches "Demo complete"
+    valid = cmd_validate(exit_on_error=False)
 
-    print("  Demo complete. ContextFold IPCF-1.1 lifecycle validated.")
-    print()
-    print("  Mottoes:")
-    print("    'Don't make the AI carry what the machine can page.'")
-    print("    'Fold changes what the model carries.'")
-    print("    'Fork changes where the model continues.'")
-    print()
+    if valid:
+        print("  Demo complete. ContextFold IPCF-1.1 lifecycle validated.")
+        print()
+        print("  Mottoes:")
+        print("    'Don't make the AI carry what the machine can page.'")
+        print("    'Fold changes what the model carries.'")
+        print("    'Fork changes where the model continues.'")
+        print()
 
 # ──────────────────────────────────────────────────────────────
 # CLI entry point
@@ -621,7 +968,7 @@ def print_usage() -> None:
 ContextFold — IPCF-1.1 Reference Implementation
 
 Usage:
-  python contextfold.py fold     <step_id> <"summary">   Archive a turn
+  python contextfold.py fold     <step_id> <"summary"> [--file path] [--files f1,f2] [--commands c1,c2] [--errors e1,e2]
   python contextfold.py scan     <"prompt">               Passively scan prompt (CONF-13 MMU)
   python contextfold.py recall   <"query">                Query archived nodes (CONF-04)
   python contextfold.py hydrate  <step_id>               Hydrate a cold node (CONF-05/06)
@@ -645,11 +992,43 @@ def main() -> None:
     try:
         if command == "fold":
             if len(args) < 3:
-                print("Usage: python contextfold.py fold <step_id> <summary>")
+                print("Usage: python contextfold.py fold <step_id> <summary> [--file path] [--files f1,f2] [--commands c1,c2] [--errors e1,e2]")
                 sys.exit(1)
             step_id = int(args[1])
-            summary = " ".join(args[2:])
-            cmd_fold(step_id, summary)
+            summary_parts = []
+            files = None
+            commands = None
+            errors = None
+            raw_content = None
+
+            i = 2
+            while i < len(args):
+                if args[i] == "--file" and i + 1 < len(args):
+                    with open(args[i+1], "r", encoding="utf-8") as f:
+                        raw_content = f.read()
+                    i += 2
+                elif args[i] == "--files" and i + 1 < len(args):
+                    files = [x.strip() for x in args[i+1].split(",") if x.strip()]
+                    i += 2
+                elif args[i] == "--commands" and i + 1 < len(args):
+                    commands = [x.strip() for x in args[i+1].split(",") if x.strip()]
+                    i += 2
+                elif args[i] == "--errors" and i + 1 < len(args):
+                    errors = [x.strip() for x in args[i+1].split(",") if x.strip()]
+                    i += 2
+                else:
+                    summary_parts.append(args[i])
+                    i += 1
+
+            summary = " ".join(summary_parts)
+            cmd_fold(
+                step_id=step_id,
+                summary=summary,
+                raw_content=raw_content,
+                files=files,
+                commands=commands,
+                errors=errors
+            )
 
         elif command == "scan":
             if len(args) < 2:
@@ -683,7 +1062,7 @@ def main() -> None:
             cmd_status()
 
         elif command == "validate":
-            cmd_validate()
+            cmd_validate(exit_on_error=True)
 
         elif command == "demo":
             cmd_demo()

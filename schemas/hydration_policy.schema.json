@@ -14,6 +14,11 @@
       "default": 3000,
       "description": "Reference default: 3000 tokens. IPCF Invariant 4 requires bounded rehydration (the cap MUST exist and be enforced); the specific threshold is a deployment policy — implementors MAY override this value. Any override must be documented in the implementation's conformance profile."
     },
+    "max_rehydration_tokens_per_turn": {
+      "type": "integer",
+      "default": 3500,
+      "description": "Turn-level rehydration budget cap (IPCF CONF-06). Total tokens hydrated across all multi-intent nodes in a single turn cannot exceed this limit."
+    },
     "scope": {
       "type": "string",
       "enum": ["single_turn"],

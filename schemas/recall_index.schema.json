@@ -9,6 +9,12 @@
       "type": "string",
       "description": "Specification version (e.g. '1.1')."
     },
+    "projection_version": {
+      "type": "string",
+      "enum": ["ipcf-projection-v2"],
+      "default": "ipcf-projection-v2",
+      "description": "Projection algorithm version ('ipcf-projection-v2' active)."
+    },
     "session_id": {
       "type": "string",
       "description": "Active conversation session identifier."
@@ -28,25 +34,34 @@
             "type": "integer",
             "description": "Canonical turn index sourced from conversation history."
           },
+          "projection_version": {
+            "type": "string",
+            "enum": ["ipcf-projection-v2"],
+            "default": "ipcf-projection-v2",
+            "description": "Projection algorithm version ('ipcf-projection-v2' active)."
+          },
           "summary": {
             "type": "string",
             "description": "Human-readable summary of the folded turn."
           },
           "payload_sha256": {
             "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
             "description": "SHA-256 of raw source content before folding (CONF-02: immutable content identity)."
           },
           "projection_sha256": {
             "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
             "description": "SHA-256 of the canonical projection fields (CONF-11: deterministic logical identity)."
           },
           "artifact_sha256": {
             "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
             "description": "SHA-256 of the serialized cold node file on disk (CONF-09: tamper detection)."
           },
           "file_path": {
             "type": "string",
-            "description": "Absolute or relative disk path to the cold storage payload file."
+            "description": "POSIX relative disk path to the cold storage payload file."
           },
           "token_estimate": {
             "type": "integer",
@@ -60,16 +75,40 @@
           "identifiers": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "Sorted, deduplicated searchable tokens extracted from summary (CONF-11: deterministic)."
+            "description": "Sorted, deduplicated searchable tokens extracted from summary and raw_content."
+          },
+          "files": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Sorted, deduplicated file paths."
+          },
+          "commands": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Sorted, deduplicated shell commands."
+          },
+          "errors": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Sorted, deduplicated error names."
           },
           "evicted": {
             "type": "boolean",
             "description": "True if this node has been evicted from the active prompt after rehydration (CONF-07)."
           }
         },
-        "required": ["step_id", "payload_sha256", "projection_sha256", "artifact_sha256", "file_path", "folded_at", "evicted"]
+        "required": [
+          "step_id",
+          "projection_version",
+          "payload_sha256",
+          "projection_sha256",
+          "artifact_sha256",
+          "file_path",
+          "folded_at",
+          "evicted"
+        ]
       }
     }
   },
-  "required": ["ipcf_version", "nodes"]
+  "required": ["ipcf_version", "projection_version", "nodes"]
 }

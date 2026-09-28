@@ -22,25 +22,27 @@
 > *"Don't ask the AI to remember what the machine can retrieve."*
 
 > ⚠️ **Specification Status: RFC Draft — Under Active Development**  
-> This repository defines an open, vendor-neutral protocol. The accompanying `contextfold.py` is a **reference implementation** that demonstrates the method is buildable — it is not a production-ready tool. The conformance test suite (`CONFORMANCE.md`) defines the normative requirements any compliant implementation must satisfy. We welcome architectural feedback, peer review, and independent implementations.
+> This repository defines an open, vendor-neutral protocol. The accompanying `contextfold.py` is a **reference implementation** that demonstrates the method is buildable — it is not a production-ready tool and it is **not yet integrated with any agent harness or IDE**. The conformance suite (`CONFORMANCE.md`) defines the requirements a compliant implementation must satisfy. See **[§12 Implementation Status & Goals](#-12-implementation-status--goals)** for exactly what is implemented today and what is still a goal. Architectural feedback, peer review, and independent implementations are welcome.
 
 ---
 
 ## 🔌 0. Runtime Assumptions & Integration Surface
 
-IPCF is engineered specifically for **active Agent Harnesses and IDE Runtimes** (such as Google Antigravity, Claude Code, Cursor, Windsurf, Aider, and custom agent loops) that programmatically assemble and manage the LLM's message array and prompt context on every conversational turn.
+IPCF is designed for **active Agent Harnesses and IDE Runtimes** (such as Google Antigravity, Claude Code, Cursor, Windsurf, Aider, and custom agent loops) that programmatically assemble the LLM's message array on every conversational turn.
 
 > ⚠️ **Non-Applicability to Passive Web Chats:**  
-> IPCF **CANNOT** run inside standard consumer web chat interfaces (such as vanilla ChatGPT or Claude.ai web UIs) where the server-side platform owns transcript persistence and appends messages monolithically without client-side memory control.
+> IPCF **cannot** run inside standard consumer web chat interfaces (such as vanilla ChatGPT or Claude.ai web UIs) where the platform owns transcript persistence and the client has no control over the prompt.
 
-### Required Harness Capabilities:
+### Required Harness Capabilities
 To implement IPCF, a hosting agent harness MUST support:
-1. **Dynamic Context Window Assembly:** The ability to inject ephemeral system or user messages into the active prompt payload *before* dispatching to the LLM.
+1. **Dynamic Context Window Assembly:** injecting ephemeral messages into the prompt payload *before* dispatching to the LLM.
 2. **Turn-Level Lifecycle Hooks:**
-   - `pre_turn_dispatch`: Intercept incoming user prompt, passively scan identifiers against `recall_index.json`, and hydrate matching cold nodes.
-   - `post_turn_response`: Execute single-turn prompt eviction (`CONF-07`), pruning hydrated nodes back down to baseline working memory before the subsequent turn.
+   - `pre_turn_dispatch`: scan the incoming user prompt against `recall_index.json` and hydrate matching cold nodes.
+   - `post_turn_response`: evict hydrated nodes after the response (`CONF-07`), returning the prompt to its baseline.
 
-> 🎨 **Concept mockup — not a screenshot.** This image illustrates the target IDE integration described in [§0 Runtime Assumptions & Integration Surface](#-0-runtime-assumptions--integration-surface). No graphical implementation exists yet — `contextfold.py` is a terminal-only reference CLI (see [§7](#-7-reference-implementation-contextfoldpy)). The UI shown here is a design goal, not a working feature.
+> **Reference implementation note:** `contextfold.py` exposes these operations as CLI commands (`scan`, `hydrate`, `evict`). The full turn lifecycle is exercised by a simulated harness (`MockHarnessContext`) in the conformance test suite; no real harness integration ships yet (see §12).
+
+> 🎨 **Concept mockup — not a screenshot.** The image below illustrates the *target* IDE integration. No graphical implementation exists; `contextfold.py` is a terminal-only CLI.
 
 ![Concept mockup of the target ContextFold IDE integration — illustrative, not a working screenshot](docs/concept-mockup-target-ui.png)
 
@@ -48,19 +50,19 @@ To implement IPCF, a hosting agent harness MUST support:
 
 ## 🎯 1. Executive Summary
 
-Modern AI coding assistants routinely reach 150,000–250,000+ tokens during extended engineering sessions. While Large Language Models advertise theoretical context windows of 1M+ tokens, empirical research (Stanford's *Lost in the Middle*, Chroma's *MECW*, RULER) establishes that **multi-step agentic reasoning degrades past 60,000–80,000 tokens ("Context Rot")**.
+Modern AI coding assistants routinely reach 150,000–250,000+ tokens during extended engineering sessions. While models advertise context windows of 1M+ tokens, published research (*Lost in the Middle*, RULER, and related long-context evaluations) reports that reasoning quality degrades well before the advertised limit ("context rot").
 
-Today's developer is trapped in a painful dichotomy:
-1. **Abandon the Session (New Chat):** Manually migrate, forfeiting visual continuity, scroll history, and cognitive scratchpad memory.
-2. **Endure Context Degradation:** Remain in the bloated session, suffering severe Time-To-First-Token (TTFT) latency, per-turn compute waste, and attention dilution loops.
+Developers are left with two poor options:
+1. **Abandon the session (new chat):** losing continuity, scroll history, and working memory.
+2. **Endure context degradation:** staying in a bloated session with rising latency, per-turn compute cost, and attention dilution.
 
-**ContextFold (IPCF-1.1)** resolves this dilemma by adapting the proven computer science paradigm of **Virtual Memory Paging** to active LLM conversation runtimes. Unlike summarization tools that discard raw history, ContextFold operates an **In-Place Dual-Projection Architecture** that keeps the developer in the same session while decoupling active prompt context from archival disk storage.
+**ContextFold (IPCF-1.1)** adapts **virtual memory paging** to LLM conversation runtimes. Instead of discarding history through summarization, IPCF moves verbose turns to verifiable cold storage on disk and pages them back into the prompt only for the turn in which they are needed.
 
 ---
 
 ## ⚖️ 2. The Four Invariants of IPCF-1.1
 
-Any compliant implementation MUST enforce four non-negotiable architectural invariants:
+Any compliant implementation MUST enforce four invariants:
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -73,50 +75,46 @@ Any compliant implementation MUST enforce four non-negotiable architectural inva
 └────────────────────────┴───────────────────────────────────────────────┘
 ```
 
-1. **Lossless Storage:** Moving data out of the active prompt does NOT mean discarding it. All historical turns exist permanently on disk.
-2. **Deterministic Folding:** The transformation of raw tool logs into folded summary schema is strictly rule-bound and reproducible — same input always produces the same output.
-3. **Exact Retrieval:** Historical information is not re-hallucinated; it is fetched directly from the verifiable cold storage file.
-4. **Bounded Rehydration:** Recalled nodes exist in the prompt strictly for the turn in which they are inspected (`scope: single_turn`). They are automatically evicted on the subsequent turn, preventing context re-bloating (`8k → 13k → 8k`).
+1. **Lossless Storage:** moving data out of the prompt never discards it; the raw payload stays on disk (`CONF-01`, `CONF-02`).
+2. **Deterministic Folding:** given the same raw payload, summary and policy, the fold engine produces a byte-identical projection (`projection_sha256`, `CONF-11`).
+3. **Exact Retrieval:** recalled content is read from disk and hash-verified, never regenerated (`CONF-05`, `CONF-09`).
+4. **Bounded Rehydration:** hydrated nodes are capped per call and per turn, and exist in the prompt only for the current turn (`scope: single_turn`, `CONF-06`, `CONF-07`).
 
-### What is Deterministic, What is Not?
+### What is Deterministic, and What is Not?
 
-To avoid conceptual ambiguity, IPCF draws a strict boundary between semantic interpretation and deterministic protocol execution:
-
-* **Semantic / Non-Deterministic Input:** Generating a high-level summary from verbose compiler outputs, test suites, or raw terminal dumps is an inherently semantic task (performed by an LLM or human engineer). IPCF does NOT claim that natural language summarization is mathematically deterministic.
-* **Deterministic / Verifiable Protocol:** Once a summary and raw payload are provided to the fold engine, the entire lifecycle — canonical projection ordering, keyword identifier extraction, indexing, SHA-256 verification (`projection_sha256`, `artifact_sha256`), filesystem persistence, and hydration — is **100% deterministic and mathematically reproducible** across platforms (CONF-11).
+* **Semantic / non-deterministic input:** writing a human-readable summary of a verbose log is a semantic task (performed by an LLM or an engineer). IPCF does not claim natural-language summarization is deterministic.
+* **Deterministic protocol:** once the summary and raw payload are handed to the fold engine, everything after that — identifier extraction, canonical projection, indexing, the three SHA-256 identities, persistence, scanning and hydration — is deterministic and reproducible (`CONF-03`, `CONF-11`).
 
 ---
 
 ## 🏛️ 3. Architecture: The Dual-Projection Model
 
-IPCF decouples the conversation representation seen by the **LLM** from the representation displayed to the **Developer**:
+IPCF separates what the **LLM** carries from what the **developer** can inspect:
 
 ```mermaid
 flowchart TD
     subgraph RawSession["Bloated Active Session (200,000+ Tokens)"]
         direction TB
-        R1["Turn 1..N: Massive Code Diffs, CLI Logs, Compiler Outputs"]
+        R1["Turn 1..N: Code Diffs, CLI Logs, Compiler Outputs"]
     end
 
-    Action["⚡ Trigger: In-Place Context Folding Action"]
+    Action["⚡ In-Place Context Folding"]
     RawSession --> Action
 
-    subgraph DualProjection["IPCF Dual-Projection Engine"]
+    subgraph DualProjection["IPCF Dual-Projection"]
         direction LR
-        
-        subgraph HotLayer["LLM Working Memory (Hot Cache)"]
+
+        subgraph HotLayer["LLM Working Memory (Hot)"]
             direction TB
-            H1["System Constraints & Constitutional Rules"]
-            H2["Chronological Folded Step Summaries"]
-            H3["Deterministic Addressing Index"]
-            H4["Active Token Footprint: ~8,000 Tokens"]
+            H1["System Constraints"]
+            H2["Folded Step Summaries (target, see §12)"]
+            H3["Recall Index (page table)"]
         end
 
-        subgraph ColdLayer["Developer UI & Cold Storage"]
+        subgraph ColdLayer["Cold Storage & Developer View"]
             direction TB
-            C1["Lossless Disk Archive (cold_nodes/step_XYZ.json)"]
-            C2["Interactive UI with '[🔍 Inspect Step Details]' Links"]
-            C3["1-Click Slide-Out Side Drawer (Zero Prompt Re-pollution)"]
+            C1["Lossless Disk Archive (cold_nodes/step_NNNNNN.json)"]
+            C2["Developer Inspection (zero prompt cost, CONF-08)"]
         end
     end
 
@@ -125,68 +123,72 @@ flowchart TD
 
 ### Virtual Memory Analogy
 
-| Operating System Paradigm | ContextFold (IPCF-1.1) Equivalent |
-| :--- | :--- |
-| **Physical RAM** | Active LLM Prompt Context (Hot Cache: ~8,000 tokens) |
-| **Disk Storage / Swap** | Lossless Cold Storage Archive (`cold_nodes/step_XYZ.json`) |
-| **Page-Out (Swap Out)** | `fold_turn()`: Compress verbose logs into schema summary on disk |
-| **Page-In (Swap In)** | `fetch_archived_node()`: On-demand single-turn rehydration |
-| **Memory Address Bus / MMU** | Deterministic Addressing Layer + **Passive Recall Interception** |
-| **Page Fault** | User or agent touches a concept archived in cold storage |
-| **Page Eviction** | Automated pruning of hydrated node on the next turn |
+| Operating System Paradigm | ContextFold (IPCF-1.1) Equivalent | Reference CLI |
+| :--- | :--- | :--- |
+| **Physical RAM** | Active LLM prompt context | — |
+| **Disk / Swap** | Lossless cold storage (`.contextfold/cold_nodes/`) | — |
+| **Page Table** | `recall_index.json` | — |
+| **Page-Out (Swap Out)** | Fold a turn into cold storage and index it | `fold` |
+| **MMU** | Passive prompt scan against the recall index | `scan` |
+| **Page-In (Swap In)** | Hash-verified single-turn rehydration | `hydrate` |
+| **Page Eviction** | Removal of hydrated content after the response | `evict` |
 
 ---
 
 ## 🔍 4. Deterministic Historical Addressing Layer
 
-### The Meta-Cognition Problem: Why Pull-Based Recall Fails
-If an architecture expects the LLM to realize *"I do not remember the Docker port from 200 turns ago, so I will invoke `recall_archived_nodes('PostgreSQL')`"*, it fails in practice.
-LLMs suffer from severe **meta-cognitive blind spots**: models rarely detect their own lack of knowledge; instead of issuing a pull-based tool call, they confidently hallucinate plausible parameters.
+### Why Pull-Based Recall Fails
+If an architecture expects the LLM to realize *"I don't remember the database port from 200 turns ago, so I'll call a recall tool"*, it fails in practice: models rarely detect their own missing knowledge and tend to produce a plausible answer instead of asking.
 
-### The Breakthrough: Push-Based Passive Recall (The Software MMU Pattern)
-In modern operating systems, virtual memory paging is **push-based and transparent**: the CPU does not ask the OS to load a missing page; the Memory Management Unit (MMU) traps the memory address access, loads the page from disk, and presents it to the process invisibly.
-
-IPCF-1.1 introduces the **Software MMU Pattern** (`CONF-13 Candidate`):
-1. **Passive Interception:** On every turn (`pre_turn_dispatch`), the Agent Harness passively scans the user prompt and working state against the set of `identifiers` indexed in `recall_index.json`.
-2. **Transparent Page-In:** If a keyword or symbol matches, the harness **automatically hydrates** the candidate cold node into the active prompt *before* the LLM generates tokens.
-3. **Zero Meta-Cognitive Burden:** The LLM does not need to know that it had forgotten the parameter; the verified ground truth is already on its desk.
-4. **Single-Turn Eviction:** Following generation, the paged-in node is evicted (`post_turn_response`), ensuring the active prompt resets to baseline (~8k tokens).
+### Push-Based Passive Recall (The Software MMU Pattern)
+In an operating system, the MMU traps an access to a missing page and loads it transparently; the process never asks. IPCF applies the same idea (`CONF-13`, candidate requirement):
+1. **Passive interception:** before each turn, the harness scans the user prompt against the identifiers, files and errors indexed in `recall_index.json`.
+2. **Transparent page-in:** matching cold nodes are hydrated into the prompt *before* the model generates a token.
+3. **No meta-cognitive burden:** the model does not need to know it had forgotten anything.
+4. **Single-turn eviction:** after the response, hydrated nodes are evicted and the prompt returns to its baseline.
 
 ```mermaid
 flowchart TD
-    USER["User asks: 'What port did we map for PostgreSQL?'"] --> HARNESS["Agent Harness (Software MMU)"]
-    HARNESS -->|"Passive Scan against recall_index identifiers"| MATCH{"Identifier Match?"}
-    MATCH -->|"Match: 'postgresql', 'port' -> Step 137"| HYDRATE["Transparent Hydration (artifact_sha256 verified)"]
-    MATCH -->|"No Match"| DISPATCH["Direct Dispatch to LLM"]
-    HYDRATE -->|"Inject Cold Node into Prompt (+2.4k tokens)"| DISPATCH
-    DISPATCH -->|"LLM Generates Verified Accurate Response"| OUT["Agent Response"]
-    OUT -->|"post_turn_response hook"| PURGE["Evict Step 137 Payload (Prompt resets to ~8k)"]
+    USER["User: 'What port did we configure for PostgreSQL?'"] --> HARNESS["Harness (Software MMU)"]
+    HARNESS -->|"Scan prompt against recall index"| MATCH{"Match?"}
+    MATCH -->|"'postgresql', 'port' → Step 137 (latest)"| HYDRATE["Hydrate (artifact_sha256 verified)"]
+    MATCH -->|"No match"| DISPATCH["Dispatch to LLM"]
+    HYDRATE --> DISPATCH
+    DISPATCH --> OUT["Response"]
+    OUT -->|"post_turn_response"| PURGE["Evict Step 137"]
 ```
 
-### Multi-Dimensional Recall Index Structure
-IPCF-1.1 specifies a **Deterministic Historical Addressing Layer** conforming to [`recall_index.schema.json`](schemas/recall_index.schema.json). During folding, machine parsing extracts an inverted index of structural entities:
+### Multi-Intent Selection and Turn Budget
+A single prompt can contain several intents (e.g. *"which port … and which migration …"*). The reference `scan` selects nodes with a **Residual Greedy Set Cover (RGSC)**:
+* repeatedly pick the node that covers the most still-unanswered query terms; ties go to the most recent step (`step_id DESC`);
+* stop when no node covers a remaining term — nodes that add nothing new (older duplicates, incidental single-word matches) are never hydrated;
+* respect a per-turn token budget (`max_rehydration_tokens_per_turn`, default 3500) in addition to the per-call cap (`max_rehydration_tokens_per_call`, default 3000);
+* **Intent ownership:** if the most recent node for an intent does not fit the remaining budget, that intent is dropped for the turn — an older, superseded node is **never** hydrated in its place. A tight budget can produce *missing* context, never *stale* context.
+
+### Recall Index Entry (excerpt)
+Each folded step is indexed per [`recall_index.schema.json`](schemas/recall_index.schema.json). Excerpt of the entry produced by the demo for step 137 (hashes shortened):
 
 ```json
 {
   "step_id": 137,
-  "folded_at": "2026-09-25T11:42:00Z",
-  "identifiers": ["5433", "postgres_db", "monofina_dev"],
-  "payload_sha256":    "a3f2...c91b",
-  "projection_sha256": "7e4d...82fa",
-  "artifact_sha256":   "b901...44cc"
+  "projection_version": "ipcf-projection-v2",
+  "summary": "PostgreSQL port 5434 reverted back to Port 5433",
+  "file_path": ".contextfold/cold_nodes/step_000137.json",
+  "identifiers": ["5433", "5434", "config", "env", "port", "postgresql", "restored", "reverted", "sed"],
+  "payload_sha256":    "…",
+  "projection_sha256": "…",
+  "artifact_sha256":   "…"
 }
 ```
 
-### Keyword-Based vs. Semantic Recall Trade-Off
-* **Reference Implementation Choice:** `contextfold.py` employs exact-token and keyword-normalized matching (`_extract_identifiers`). This preserves the **Zero External Dependencies** mandate (pure Python standard library, no torch, no numpy, no vector DB).
-* **The Trade-Off:** Keyword matching is fast, zero-cost, and strictly deterministic, but vulnerable to synonyms or paraphrased queries.
-* **Production Extension Path:** Production harnesses (IDE plugins, enterprise agents) are explicitly encouraged to extend the recall index with local vector embeddings or hybrid BM25 + dense retrieval without altering the cold storage or SHA-256 verification contracts.
+### Keyword-Based vs. Semantic Recall
+* **Reference choice:** `contextfold.py` uses exact-term matching after Unicode NFC normalization and case folding (including Turkish dotted/dotless *i*). This keeps the implementation dependency-free (Python standard library only) and fully deterministic.
+* **Trade-off:** exact terms do not match synonyms, paraphrases, prefixes (`postgres` vs `postgresql`) or inflected forms.
+* **Extension path:** production harnesses may add embeddings or hybrid BM25 + dense retrieval on top of the index, without changing the cold storage or hash verification contracts.
 
 ---
 
 ## 📏 5. Three Hash Identities (CONFORMANCE.md §2)
-
-Every folded artifact carries three distinct hash identities, each answering a different question:
 
 ```text
                 ContextFold Identity Model
@@ -205,145 +207,186 @@ Every folded artifact carries three distinct hash identities, each answering a d
 | Identity | Computed From | Changes When? |
 | :--- | :--- | :--- |
 | `payload_sha256` | Raw source content (UTF-8) | Never — immutable |
-| `projection_sha256` | Canonical fields in fixed order (step_id, normalized_content, sorted identifiers) | Projection algorithm changes |
-| `artifact_sha256` | Full serialized cold node file | Serialization format changes |
+| `projection_sha256` | Eight canonical fields in fixed order: projection version, step id, normalized content, sorted identifiers / files / commands / errors, and the hash of the active hydration policy | The projection algorithm or the active policy changes |
+| `artifact_sha256` | Canonical serialization of the cold node file (excluding this field) | Any byte of the stored node changes |
 
 ---
 
 ## 🧪 6. The 500-Turn Verification Scenario
 
-To demonstrate IPCF-1.1, consider a long-running 500-turn refactoring session:
+The demo (`python contextfold.py demo`) folds eight representative turns of a long refactoring session:
 
-* **Turn 37:** PostgreSQL container mapped to host port `5433`.
-* **Turn 91:** Port switched to `5434` (conflict resolution).
-* **Turn 137:** Port reverted to `5433`.
-* **Turn 318:** Migration script `V12__TenantBilling.sql` applied.
+| Turn | Event |
+| :--- | :--- |
+| 37 | PostgreSQL configured on port `5433` |
+| 91 | Port switched to `5434` (conflict resolution) |
+| 137 | Port reverted back to `5433` |
+| 200 | Authentication middleware refactored |
+| 318 | Migration `V12__TenantBilling.sql` applied |
+| 342 | Migration V12 rolled back (deadlock in billing table) |
+| 447 | Migration V12 patched and re-applied |
+| 499 | Final review: services healthy |
 
 ```text
-At Turn 490, developer asks:
+Developer asks:
 "What port are we using for PostgreSQL, and which migration applied the billing table?"
 
-Without ContextFold:
-- Context is at 230,000 tokens. Severe attention dilution, high hallucination.
+Reference scan (reproducible with the demo and the test suite):
+  → hydrate Steps 342, 137, 447
+  → not hydrated: 91, 37 (superseded port states), 318, 499 (add no new terms)
 
-With ContextFold:
-1. Active prompt is at 8,200 tokens.
-2. Harness Software MMU scans user query: matches ['postgresql', 'port'] -> Step 137 (latest chronological), Step 91, Step 37.
-3. Harness transparently hydrates Step 137 (SHA-256 verified) before model execution.
-4. Model generates exact, verified response in 1.1s.
-5. Post-turn hook evicts Step 137 payload. Active prompt returns to 8,200 tokens.
+Illustrative harness flow (token figures are illustrative, not measured):
+  1. Baseline prompt ≈ 8k tokens.
+  2. pre_turn_dispatch hydrates the selected nodes (hash-verified, within the turn budget).
+  3. The model answers from verified history.
+  4. post_turn_response evicts them; the prompt returns to baseline.
 ```
 
-> **The key insight:** The model does NOT carry 500 turns of baggage. But when needed, it retrieves the verified truth instantly — without hallucination.
+> **Key idea:** the model does not carry 500 turns of history — but when a turn needs it, the verified record is paged in.
 
 ---
 
 ## 💻 7. Reference Implementation (`contextfold.py`)
 
-ContextFold provides an official reference CLI written in pure Python 3.10+ standard library, demonstrating that the IPCF method is buildable with zero external dependencies.
+Pure Python 3.10+, standard library only.
 
-> **Scope Note:** `contextfold.py` is a **reference implementation** — its purpose is to demonstrate protocol feasibility and serve as a specification artifact, not to be production-hardened. Independent implementations by IDE vendors and agent harness teams are explicitly encouraged.
+> **Scope:** a reference implementation that demonstrates protocol feasibility and serves as a specification artifact — not a production-hardened tool.
 
 ```bash
-# Archive a turn into cold storage
-python contextfold.py fold 42 "PostgreSQL configured on port 5433"
+# Fold a turn into cold storage (raw payload from a file; summary is required)
+python contextfold.py fold 42 "PostgreSQL configured on port 5433" --file turn42.log
 
-# Passively scan user prompt against recall index (Software MMU pattern)
+# Passive MMU scan of a prompt (multi-intent, budget-aware)
 python contextfold.py scan "What port did we set for PostgreSQL?"
 
-# Query archived nodes explicitly
+# Explicit recall with coverage tiering and chronological labels
 python contextfold.py recall "PostgreSQL port"
 
-# Hydrate a cold node into active prompt (SHA-256 verified)
+# Hash-verified hydration (bounded by the per-call cap)
 python contextfold.py hydrate 42
 
-# Evict after LLM response (CONF-07)
+# Record eviction after the response (CONF-07)
 python contextfold.py evict 42
 
-# Show session status
+# Session summary
 python contextfold.py status
 
-# Run integrity check on all cold nodes
+# Integrity check: hashes, orphaned nodes, broken references, path containment
 python contextfold.py validate
 
-# Run 500-turn simulation
+# Scenario from §6
 python contextfold.py demo
+```
+
+Run the conformance suite:
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
 ---
 
 ## 📐 8. Formal Protocol Schemas (`schemas/`)
 
-| Schema File | Purpose |
-| :--- | :--- |
-| **[`cold_node.schema.json`](schemas/cold_node.schema.json)** | Validates the cold storage payload including all three hash identities. |
-| **[`recall_index.schema.json`](schemas/recall_index.schema.json)** | Validates the Deterministic Historical Addressing Layer (dict keyed by step_id). |
-| **[`folded_step.schema.json`](schemas/folded_step.schema.json)** | Validates the lean structured folded step summary retained in active prompt. |
-| **[`hydration_policy.schema.json`](schemas/hydration_policy.schema.json)** | Enforces bounded single-turn rehydration and automatic prompt eviction. |
+| Schema File | Purpose | Reference implementation |
+| :--- | :--- | :--- |
+| **[`cold_node.schema.json`](schemas/cold_node.schema.json)** | Cold storage payload, including the three hash identities | Produced by `fold` |
+| **[`recall_index.schema.json`](schemas/recall_index.schema.json)** | Recall index (page table), keyed by step id | Produced by `fold` |
+| **[`hydration_policy.schema.json`](schemas/hydration_policy.schema.json)** | Per-call and per-turn caps, single-turn scope, eviction trigger | Read by `scan` / `hydrate` |
+| **[`folded_step.schema.json`](schemas/folded_step.schema.json)** | Compact folded-step summary kept in the active prompt | **Specified only — not yet produced** (see §12) |
+
+> The reference CLI does not validate files against these JSON Schemas at runtime; `validate` checks hashes, references and path containment.
 
 ---
 
-## 🧭 9. The Architecture: Agent Context System (ACS)
+## 🧭 9. Agent Context System (ACS) — Architectural Vision
 
-ContextFold forms the memory management tier of the **Agent Context System**:
+ContextFold is intended as the memory tier of a broader **Agent Context System**:
 
 ```text
                          AGENT CONTEXT SYSTEM (ACS)
-                                         │
-                 ┌───────────────────────┴───────────────────────┐
-                 ▼                                               ▼
-          [RUNTIME LAYER]                                [WORKSPACE LAYER]
-                 │                                               │
-        ┌────────┴────────┐                                      ▼
-        ▼                 ▼                                [ACQUISITION]
-  ContextFold        ContextFork                           git-grep-first
- (Memory Paging)   (Session Handoff)                       (Search Policy)
-  • Same Session    • Cross Session                        • Zero token bloat
-  • Hot/Cold split  • 6-part verifiable handoff            • Native git grep
-  • Recall index    • Evidence & Git state                 • Anti-Select-String
-  • Auto-eviction   • Role-based context shaping
+                                    │
+                 ┌──────────────────┴──────────────────┐
+                 ▼                                     ▼
+          [RUNTIME LAYER]                      [WORKSPACE LAYER]
+                 │                                     │
+        ┌────────┴────────┐                            ▼
+        ▼                 ▼                     Search / acquisition
+  ContextFold        ContextFork                policy (concept)
+ (memory paging)   (session handoff)
+  • same session    • cross session
+  • hot/cold split  • verifiable handoff
+  • recall index
+  • auto-eviction
 ```
+
+* **ContextFork** (IPSF-1.2) is a separate open specification: [github.com/mrblackman/ContextFork](https://github.com/mrblackman/ContextFork).
+* The workspace layer is a design direction, not a published component.
 
 ---
 
 ## 🛡️ 10. Security Design Notes
 
-1. **Secret Scrubbing Prior to Serialization:** Raw terminal streams may contain API tokens or database passwords. All payloads written to `cold_nodes/` MUST pass through regex redaction before setting `sanitized: true`. The reference implementation sets `sanitized: false` to make this explicit — production implementations MUST implement this step.
-2. **Ephemeral Memory Boundaries:** Hydrated historical nodes MUST NOT leak into the persistent session transcript. They are strictly single-turn scratchpad inputs.
-3. **Integrity Hashes:** Every cold node is referenced by its `artifact_sha256` in the recall index. Any on-disk tampering is detected on the next `validate` or `hydrate` call.
+1. **Integrity:** every cold node is referenced by its `artifact_sha256`; on-disk tampering is detected by `hydrate` and `validate` (`CONF-09`).
+2. **Path containment:** the stored `file_path` is never trusted. The engine derives the canonical path from the step id and rejects traversal, absolute paths, sibling-prefix directories and symlink escapes — independently of the `integrity_verification` policy flag (`CONF-12`).
+3. **Ephemeral boundaries:** hydrated nodes MUST NOT leak into the persistent session transcript; they are single-turn inputs.
+4. **Secret scrubbing (required for production, not implemented):** raw terminal output may contain credentials. Production implementations MUST redact payloads before writing cold nodes and then set `sanitized: true`. The reference implementation performs no redaction and always writes `sanitized: false` to make this explicit.
 
 ---
 
 ## 🧪 11. Conformance & Verification (`CONFORMANCE.md`)
 
-To guarantee that ContextFold engines operate deterministically, the specification defines **13 Normative Conformance Requirements** in **[CONFORMANCE.md](CONFORMANCE.md)**:
+The specification defines **13 conformance requirements** (12 normative core + 1 candidate), verified by **16 automated tests**:
 
-* **CONF-01 – CONF-03:** Lossless storage, SHA-256 round-trip integrity, and deterministic indexing.
-* **CONF-04:** Temporal disambiguation (chronological resolution when configurations evolve across turns).
-* **CONF-05 – CONF-07:** Exact verbatim retrieval, bounded rehydration caps, and single-turn prompt eviction.
-* **CONF-08 – CONF-10:** UI dual-projection isolation, tamper detection, and explicit failure modes.
-* **CONF-11 – CONF-12:** Deterministic replay (projection_sha256) and atomic fold integrity.
-* **CONF-13 (Candidate):** Passive recall interception coverage (Software MMU push-based transparent hydration).
+* **CONF-01 – CONF-03:** lossless storage, SHA-256 round-trip integrity, deterministic indexing.
+* **CONF-04:** temporal disambiguation in recall (coverage tiering, `step_id DESC`, exact-term matching).
+* **CONF-05 – CONF-07:** exact retrieval, bounded rehydration (per-call and per-turn), single-turn eviction.
+* **CONF-08 – CONF-10:** developer-view isolation, tamper detection, explicit failure modes.
+* **CONF-11 – CONF-12:** deterministic replay (`projection_sha256` v2), inconsistent-state detection and path containment.
+* **CONF-13 (candidate):** passive recall interception (Software MMU), multi-intent selection with intent ownership, Unicode normalization.
 
-Implementations must satisfy the test suite to claim **`IPCF-1.1 Compliant`** status.
+An implementation must pass the suite to claim **`IPCF-1.1 Compliant`** status.
 
 ---
 
-## 🗺️ 12. Relationship to Prior & Related Work
+## 🗺️ 12. Implementation Status & Goals
+
+### Implemented in the reference CLI
+* Two-phase atomic fold to cold storage with the three hash identities.
+* Recall index, exact-term matching with Unicode / Turkish case folding.
+* Recall with coverage tiering and chronological labels.
+* Passive MMU scan with multi-intent selection (RGSC), per-turn budget and intent ownership.
+* Hash-verified hydration with per-call cap; eviction logging.
+* Integrity validation: tamper detection, orphaned nodes, broken references, path containment.
+* Conformance suite: 13 requirements, 16 tests, simulated harness lifecycle.
+
+### Goals (not yet implemented)
+* **Hot projection:** producing the folded-step summary defined by `folded_step.schema.json` — the compact record that replaces a folded turn in the active prompt.
+* **Real harness integration:** hooking `pre_turn_dispatch` / `post_turn_response` into an actual agent harness or IDE (e.g. via an MCP server). Today the lifecycle is only simulated in tests.
+* **IDE user interface:** the inspector shown in the concept mockup.
+* **Secret scrubbing** before cold storage writes (`sanitized: true`).
+* **Runtime JSON Schema validation** of generated artifacts.
+* **Accurate token accounting:** the reference uses a ~4 characters/token heuristic.
+* **Repair protocol:** IPCF-1.1 requires detecting and refusing inconsistent state, not repairing it; automatic repair is a possible future extension.
+* **Richer matching:** prefix, morphological (e.g. Turkish suffixes) or semantic matching, and adaptive per-turn budgets.
+
+---
+
+## 📚 13. Relationship to Prior & Related Work
 
 | Prior Work | What it does | What IPCF adds |
 | :--- | :--- | :--- |
-| **Claude Code `/compact`** | Summarizes the session in-place, replacing old messages | IPCF archives to external cold storage — raw history is preserved and verifiable; nothing is destructively overwritten |
-| **MemGPT / Letta** | Hierarchical memory with main context + archival memory paging | IPCF targets *session-level* context in IDE tooling rather than autonomous agent memory; adds deterministic SHA-256 verification and a normative conformance test suite |
-| **LangGraph Checkpoints** | Graph state snapshots for resumability | IPCF is LLM-native, IDE-level, and targets developer workflow; it captures *intent* (summaries) alongside *state* (hash-verified cold nodes), rather than agent graph internals |
-| **Sliding Window Attention** | Model-level truncation of old tokens | IPCF is application-level and lossless — discarded content is preserved and retrievable; the model is never unilaterally truncated |
-| **ContextFork (IPSF-1.2)** | Session handoff — transfers context to a new session | IPCF keeps the developer in the *same* session; ContextFold and ContextFork are complementary layers of the ACS stack |
+| **Claude Code `/compact`** | Summarizes the session in place, replacing old messages | Raw history is archived to verifiable cold storage instead of being overwritten |
+| **MemGPT / Letta** | Hierarchical agent memory with archival paging | Targets session-level context in developer tooling; adds SHA-256 verification and a conformance suite |
+| **LangGraph checkpoints** | Graph state snapshots for resumability | Focuses on conversational context paging rather than agent graph state |
+| **Sliding-window attention** | Model-level truncation of old tokens | Application-level and lossless — nothing is unilaterally discarded |
+| **ContextFork (IPSF-1.2)** | Session handoff to a new session | Complementary: ContextFold keeps the developer in the *same* session |
 
-**The IPCF contribution:** The combination of (1) lossless cold storage with SHA-256 verification, (2) deterministic historical addressing enabling exact retrieval without vector similarity, (3) bounded single-turn rehydration preventing context re-bloating, (4) push-based passive recall interception (Software MMU pattern), and (5) a vendor-neutral open schema with a formal conformance test suite.
+**The IPCF contribution:** (1) lossless cold storage with SHA-256 verification, (2) deterministic addressing for exact retrieval without vector similarity, (3) bounded single-turn rehydration, (4) push-based passive recall (Software MMU), and (5) an open schema set with a formal conformance suite.
 
 ---
 
-## 📜 13. License & Attribution
+## 📜 14. License & Attribution
 
 Released under the **[MIT License](LICENSE)**.
 

@@ -5,3 +5,8 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Internal Karargah Documents (kept locally for dual-agent file bus)
+planlar/
+mimari/
+AGENTS.md

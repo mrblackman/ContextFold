@@ -190,7 +190,7 @@ In long-horizon agentic workflows, configurations evolve, get reverted, and re-a
 ```text
 Turn 37:  PostgreSQL configured on Port 5433
 Turn 91:  PostgreSQL switched to Port 5434 (Conflict resolution)
-Turn 137: Port 5434 reverted back to Port 5433
+Turn 137: PostgreSQL port 5434 reverted back to Port 5433
 Turn 318: Migration V12 applied
 Turn 342: Migration V12 rolled back due to deadlocks
 Turn 447: Migration V12 patched and re-applied
@@ -211,6 +211,16 @@ When the model executes `recall_archived_nodes(query="PostgreSQL port")`:
    }
    ```
 3. This allows the model to correctly reason: *"Port 5433 was initially assigned, temporarily changed to 5434 in step 91, and reverted to 5433 in step 137."*
+
+#### Multi-Intent MMU Scan and Coverage Tiering (`cmd_scan` vs `cmd_recall`):
+When queries contain multiple distinct intents or match nodes across varying degrees of specificity:
+1. **Interactive Manual Recall (`cmd_recall`):**
+   - **Primary Coverage Tier:** Nodes matching the maximal count of distinct query terms are grouped in the primary tier and sorted chronologically (`step_id DESC`). The highest `step_id` is assigned `latest_chronological`, intermediary nodes receive `superseded`, and the oldest node receives `historical`.
+   - **Secondary Coverage Tier (`related`):** Nodes matching fewer distinct query terms (partial matches) are isolated into a secondary tier with status `related`. These nodes remain accessible in recall listings but MUST NOT usurp primary tier ranking.
+2. **Software MMU Scan (`cmd_scan`):**
+   - Candidate selection across multiple intents is executed via **Residual Greedy Set Cover (RGSC)** bounded by the turn token budget (`max_rehydration_tokens_per_turn`).
+   - Tie-breaking: sorted by `(residual_gain DESC, step_id DESC)`.
+   - **Intent Ownership (CONF-06 / CONF-13):** If an oversized candidate cannot fit the remaining turn budget, its covered terms MUST still be subtracted from the residual query terms (`residual -= candidate_terms`). A superseded candidate (e.g. Step 91) MUST NOT usurp an intent simply because it has a smaller token footprint. *"A budget cap may cause missing information, but NEVER outdated or false information."*
 
 ---
 
@@ -327,7 +337,7 @@ An IPCF-compliant Agent Harness SHOULD implement **push-based passive recall int
    Upon receiving the LLM's response (`post_turn_response`), the harness MUST evict the hydrated payload, returning active prompt tokens to baseline working memory (`CONF-07`).
 
 #### Pass Criteria:
-- **Test:** Submit a user query mentioning an indexed identifier (e.g. `"5433"` or `"PostgreSQL"`) to a harness running without active LLM tool calling enabled.
+- **Test:** Submit a user query mentioning an indexed identifier (e.g. `"PostgreSQL port"` or `"sipariş_tablosu"`) to a harness running without active LLM tool calling enabled.
 - **Assertion:** The harness MUST intercept the identifier, hydrate Step 137 into prompt memory, and verify that `artifact_sha256` is validated before model dispatch.
 - **Post-condition:** On the following turn, active context token count MUST return to baseline (confirming eviction).
 
@@ -344,23 +354,27 @@ python -m unittest tests/test_ipcf_conformance.py
 
 Expected output:
 ```text
-test_conf01_lossless_storage (tests.test_ipcf_conformance) ... ok
-test_conf02_sha256_roundtrip (tests.test_ipcf_conformance) ... ok
-test_conf03_deterministic_indexing (tests.test_ipcf_conformance) ... ok
-test_conf04_temporal_disambiguation (tests.test_ipcf_conformance) ... ok
-test_conf05_verbatim_retrieval (tests.test_ipcf_conformance) ... ok
-test_conf06_bounded_rehydration_cap (tests.test_ipcf_conformance) ... ok
-test_conf07_enforced_eviction_cycle (tests.test_ipcf_conformance) ... ok
-test_conf08_dual_projection_isolation (tests.test_ipcf_conformance) ... ok
-test_conf09_tamper_detection (tests.test_ipcf_conformance) ... ok
-test_conf10_explicit_failure_modes (tests.test_ipcf_conformance) ... ok
-test_conf11_deterministic_replay (tests.test_ipcf_conformance) ... ok
-test_conf12_crash_recovery_atomic_fold (tests.test_ipcf_conformance) ... ok
+test_conf_01_lossless_storage (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_01_lossless_storage) ... ok
+test_conf_02_payload_round_trip (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_02_payload_round_trip) ... ok
+test_conf_03_deterministic_addressing (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_03_deterministic_addressing) ... ok
+test_conf_04_temporal_disambiguation (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_04_temporal_disambiguation) ... ok
+test_conf_05_exact_verbatim_retrieval (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_05_exact_verbatim_retrieval) ... ok
+test_conf_06_bounded_rehydration_cap (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_06_bounded_rehydration_cap) ... ok
+test_conf_06_turn_budget (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_06_turn_budget) ... ok
+test_conf_07_enforced_eviction_cycle (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_07_enforced_eviction_cycle) ... ok
+test_conf_08_dual_projection_isolation (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_08_dual_projection_isolation) ... ok
+test_conf_09_tamper_detection (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_09_tamper_detection) ... ok
+test_conf_10_explicit_failure_mode (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_10_explicit_failure_mode) ... ok
+test_conf_11_deterministic_replay (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_11_deterministic_replay) ... ok
+test_conf_12_inconsistent_state_detection (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_12_inconsistent_state_detection) ... ok
+test_conf_12_path_containment (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_12_path_containment) ... ok
+test_conf_13_multi_intent (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_13_multi_intent) ... ok
+test_conf_13_passive_mmu_unicode (tests.test_ipcf_conformance.TestIPCFConformance.test_conf_13_passive_mmu_unicode) ... ok
 
 ----------------------------------------------------------------------
-Ran 12 tests in 0.521s
+Ran 16 tests in 1.821s
 
-OK (IPCF-1.1 Fully Compliant)
+OK (13 Conformance Requirements Verified Across 16 Test Cases — IPCF-1.1 Fully Compliant)
 ```
 
 ---
